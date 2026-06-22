@@ -192,8 +192,12 @@ def export_video(video_id: int, kind: str, fmt: str) -> Response:
 
 
 def fts_query(value: str) -> str:
-    terms = [term.replace('"', "") for term in value.strip().split() if term.strip()]
-    return " OR ".join(f'"{term}"' for term in terms) or '""'
+    terms = []
+    for raw_term in value.strip().split():
+        term = "".join(char for char in raw_term if char.isalnum() or char in ("_", "-"))
+        if term:
+            terms.append(f"{term}*")
+    return " OR ".join(terms) or '""'
 
 
 def run_yt_dlp(args: list[str]) -> subprocess.CompletedProcess[str]:
