@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="it">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Video Transcript</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="panel import-panel">
+        <div>
+          <h1>Video Transcript</h1>
+          <p>Trascrizione, riassunto per punti, archivio e ricerca locale.</p>
+        </div>
+        <form id="video-form" class="import-form">
+          <input id="url" name="url" type="url" placeholder="Link YouTube o VK Video" required />
+          <select id="language_hint" name="language_hint">
+            <option value="auto">Lingua auto</option>
+            <option value="it">Italiano</option>
+            <option value="ru">Russo</option>
+          </select>
+          <button type="submit">Processa</button>
+        </form>
+        <div id="status" class="status"></div>
+      </section>
+
+      <section class="toolbar">
+        <input id="search" type="search" placeholder="Cerca in metadati, trascrizioni e riassunti" />
+        <select id="category-filter">
+          <option value="">Tutte le categorie</option>
+        </select>
+      </section>
+
+      <section class="content">
+        <div id="grid" class="grid"></div>
+      </section>
+
+      <dialog id="detail" class="detail-dialog">
+        <article class="panel detail"></article>
+      </dialog>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
