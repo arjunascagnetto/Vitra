@@ -23,10 +23,22 @@ from .database import BASE_DIR, DATA_DIR, TS_CONFIG, get_connection, init_db, ro
 load_dotenv(BASE_DIR / ".env")
 
 DEFAULT_SUMMARY_MODEL = "gpt-5.5"
+SUMMARY_MODEL = os.getenv("OPENAI_SUMMARY_MODEL", DEFAULT_SUMMARY_MODEL)
 EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-# Published OpenAI Whisper API price (USD per minute of audio). Override via env if
-# it changes. Transcription is the dominant, duration-driven cost of the pipeline.
+
+# Published OpenAI prices (USD), verified online; override via env if they change.
+# Whisper is billed per audio minute; the summary model (gpt-5.4 by default) and
+# the embedding model are billed per token.
 WHISPER_USD_PER_MINUTE = float(os.getenv("WHISPER_USD_PER_MINUTE", "0.006"))
+SUMMARY_USD_PER_1M_INPUT = float(os.getenv("SUMMARY_USD_PER_1M_INPUT", "2.50"))
+SUMMARY_USD_PER_1M_OUTPUT = float(os.getenv("SUMMARY_USD_PER_1M_OUTPUT", "15.0"))
+EMBEDDING_USD_PER_1M = float(os.getenv("EMBEDDING_USD_PER_1M", "0.02"))
+# Heuristics to size the token-billed calls from the video duration before any
+# transcript exists: ~150 spoken words/min, ~1.3 tokens/word -> ~200 tokens/min;
+# the summary call emits a bounded JSON payload.
+TRANSCRIPT_TOKENS_PER_MINUTE = float(os.getenv("TRANSCRIPT_TOKENS_PER_MINUTE", "200"))
+SUMMARY_OUTPUT_TOKENS = int(os.getenv("SUMMARY_OUTPUT_TOKENS", "1500"))
+
 OPENAI_AUDIO_LIMIT_BYTES = 24 * 1024 * 1024
 # Keep embedding input well under the model's 8191-token limit (~4 chars/token).
 EMBEDDING_INPUT_CHARS = 24000
@@ -121,16 +133,40 @@ def get_video(video_id: int) -> dict[str, Any]:
     return video
 
 
-def estimate_transcription_cost(duration_seconds: Any) -> float | None:
-    # Whisper is billed per minute of audio; estimate from the source duration
-    # (known from metadata before any download/transcription happens).
+def estimate_costs(duration_seconds: Any) -> dict[str, float | None]:
+    # Estimate the per-stage USD cost from the source duration, known from metadata
+    # before any download/transcription. Returns None values when duration is
+    # unknown (live streams etc.), since every stage scales with audio length.
     try:
         seconds = float(duration_seconds)
     except (TypeError, ValueError):
-        return None
+        seconds = 0.0
     if seconds <= 0:
-        return None
-    return round((seconds / 60.0) * WHISPER_USD_PER_MINUTE, 4)
+        return {"transcription_usd": None, "summary_usd": None, "embedding_usd": None, "total_usd": None}
+
+    minutes = seconds / 60.0
+    transcript_tokens = minutes * TRANSCRIPT_TOKENS_PER_MINUTE
+
+    transcription = minutes * WHISPER_USD_PER_MINUTE
+
+    # `summarize`: (capped) timestamped transcript in, bounded JSON summary out.
+    # `categorize_video`: short transcript + summary extract in, tiny category out.
+    summary_input = min(transcript_tokens, 30000) + 400
+    categorize_input = min(transcript_tokens, 3000) + min(SUMMARY_OUTPUT_TOKENS, 1500) + 200
+    input_tokens = summary_input + categorize_input
+    output_tokens = SUMMARY_OUTPUT_TOKENS + 20
+    summary = (
+        input_tokens * SUMMARY_USD_PER_1M_INPUT + output_tokens * SUMMARY_USD_PER_1M_OUTPUT
+    ) / 1_000_000
+
+    embedding = min(transcript_tokens + 400, 6000) * EMBEDDING_USD_PER_1M / 1_000_000
+
+    return {
+        "transcription_usd": round(transcription, 4),
+        "summary_usd": round(summary, 4),
+        "embedding_usd": round(embedding, 6),
+        "total_usd": round(transcription + summary + embedding, 4),
+    }
 
 
 @app.post("/api/videos/estimate")
@@ -143,9 +179,13 @@ def estimate_video(url: str = Form(...)) -> dict[str, Any]:
     return {
         "title": metadata.get("title"),
         "duration": duration,
-        "estimated_cost_usd": estimate_transcription_cost(duration),
         "currency": "USD",
-        "rate_per_minute": WHISPER_USD_PER_MINUTE,
+        "models": {
+            "transcription": "whisper-1",
+            "summary": SUMMARY_MODEL,
+            "embedding": EMBEDDING_MODEL,
+        },
+        "costs": estimate_costs(duration),
     }
 
 
@@ -172,7 +212,7 @@ def process_video(
         summary = combined_summary_text(summary_data)
         category = categorize_video(transcript_text, summary, metadata)
         embedding = embed_text(build_embedding_text(metadata, summary, transcript_text))
-        estimated_cost = estimate_transcription_cost(metadata.get("duration"))
+        estimated_cost = estimate_costs(metadata.get("duration"))["total_usd"]
         saved_audio_path = persist_audio(prepared_audio_path, metadata)
         saved = save_video(
             url,

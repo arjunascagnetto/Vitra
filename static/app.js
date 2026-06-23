@@ -14,9 +14,46 @@ const els = {
   grid: document.querySelector("#grid"),
   detail: document.querySelector("#detail"),
   detailPanel: document.querySelector("#detail .detail"),
+  confirm: document.querySelector("#confirm"),
   search: document.querySelector("#search"),
   categoryFilter: document.querySelector("#category-filter"),
 };
+
+// In-page confirmation dialog styled like the rest of the app (replaces the
+// native window.confirm). Returns a Promise<boolean>.
+function openConfirm({ title, bodyHtml, confirmLabel = "Conferma", danger = false }) {
+  const dlg = els.confirm;
+  dlg.querySelector(".confirm-title").textContent = title;
+  dlg.querySelector(".confirm-body").innerHTML = bodyHtml;
+  const ok = dlg.querySelector("[data-ok]");
+  const cancel = dlg.querySelector("[data-cancel]");
+  ok.textContent = confirmLabel;
+  ok.classList.toggle("danger", danger);
+  return new Promise((resolve) => {
+    const finish = (result) => {
+      ok.removeEventListener("click", onOk);
+      cancel.removeEventListener("click", onCancel);
+      dlg.removeEventListener("cancel", onDismiss);
+      dlg.removeEventListener("click", onBackdrop);
+      if (dlg.open) dlg.close();
+      resolve(result);
+    };
+    const onOk = () => finish(true);
+    const onCancel = () => finish(false);
+    const onDismiss = (event) => {
+      event.preventDefault();
+      finish(false);
+    };
+    const onBackdrop = (event) => {
+      if (event.target === dlg) finish(false);
+    };
+    ok.addEventListener("click", onOk);
+    cancel.addEventListener("click", onCancel);
+    dlg.addEventListener("cancel", onDismiss);
+    dlg.addEventListener("click", onBackdrop);
+    dlg.showModal();
+  });
+}
 
 // Backend processing is a single synchronous request, so we can't report real
 // progress. Show an indeterminate bar and advance through the typical pipeline
@@ -66,7 +103,12 @@ els.form.addEventListener("submit", async (event) => {
     setStatus(error.message, true);
     return;
   }
-  if (!window.confirm(estimateMessage(estimate))) {
+  const proceed = await openConfirm({
+    title: estimate.title || "Stima di costo",
+    bodyHtml: estimateBodyHtml(estimate),
+    confirmLabel: "Processa",
+  });
+  if (!proceed) {
     setStatus("Elaborazione annullata.");
     return;
   }
@@ -84,19 +126,35 @@ els.form.addEventListener("submit", async (event) => {
   }
 });
 
-function estimateMessage(estimate) {
-  const title = estimate.title || "Video";
-  if (estimate.estimated_cost_usd == null) {
-    return `${title}\n\nDurata non disponibile: impossibile stimare il costo di trascrizione.\n\nProcedere comunque con l'elaborazione?`;
+function estimateBodyHtml(estimate) {
+  const costs = estimate.costs || {};
+  if (costs.total_usd == null) {
+    return `
+      <p>Durata non disponibile: impossibile stimare il costo.</p>
+      <p>Vuoi procedere comunque con l'elaborazione?</p>
+    `;
   }
+  const models = estimate.models || {};
   const minutes = estimate.duration ? Math.round(estimate.duration / 60) : "?";
-  return (
-    `${title}\n\n` +
-    `Durata: ~${minutes} min\n` +
-    `Costo stimato di trascrizione: ${formatCost(estimate.estimated_cost_usd)} ` +
-    `(Whisper, ${formatCost(estimate.rate_per_minute)}/min)\n\n` +
-    `Procedere con l'elaborazione?`
-  );
+  const row = (label, model, value) => `
+    <tr>
+      <td>${escapeHtml(label)}${model ? ` <span class="cost-model">${escapeHtml(model)}</span>` : ""}</td>
+      <td class="cost-value">${formatCost(value)}</td>
+    </tr>`;
+  return `
+    <p class="confirm-meta">Durata stimata: ~${minutes} min</p>
+    <table class="cost-table">
+      <tbody>
+        ${row("Trascrizione", models.transcription, costs.transcription_usd)}
+        ${row("Riassunti e categoria", models.summary, costs.summary_usd)}
+        ${row("Embedding", models.embedding, costs.embedding_usd)}
+      </tbody>
+      <tfoot>
+        ${row("Totale stimato", "", costs.total_usd)}
+      </tfoot>
+    </table>
+    <p class="confirm-note">Stima indicativa basata sui prezzi OpenAI e sulla durata del video.</p>
+  `;
 }
 
 function formatCost(value) {
@@ -196,7 +254,16 @@ async function selectVideo(id) {
 }
 
 async function deleteVideo(id, title) {
-  if (!confirm(`Eliminare definitivamente "${title}"?`)) return;
+  const proceed = await openConfirm({
+    title: "Elimina contenuto",
+    bodyHtml: `
+      <p>Eliminare definitivamente <strong>${escapeHtml(title)}</strong>?</p>
+      <p class="confirm-note">L'operazione non è reversibile e rimuove anche l'audio salvato.</p>
+    `,
+    confirmLabel: "Elimina",
+    danger: true,
+  });
+  if (!proceed) return;
   try {
     const response = await fetch(`/api/videos/${id}`, { method: "DELETE" });
     await readJson(response);
@@ -221,7 +288,7 @@ function renderDetail() {
       <div>
         <span class="pill">${escapeHtml(video.category)}</span>
         <h2>${escapeHtml(video.title)}</h2>
-        <p class="meta">${escapeHtml(video.uploader || "")} ${video.webpage_url ? `· <a href="${escapeHtml(video.webpage_url)}" target="_blank" rel="noreferrer">Apri video</a>` : ""}${video.estimated_cost_usd != null ? ` · Costo stimato trascrizione: ${formatCost(video.estimated_cost_usd)}` : ""}</p>
+        <p class="meta">${escapeHtml(video.uploader || "")} ${video.webpage_url ? `· <a href="${escapeHtml(video.webpage_url)}" target="_blank" rel="noreferrer">Apri video</a>` : ""}${video.estimated_cost_usd != null ? ` · Costo stimato: ${formatCost(video.estimated_cost_usd)}` : ""}</p>
       </div>
       <button class="icon-button" type="button" data-close aria-label="Chiudi">×</button>
     </div>
