@@ -75,6 +75,7 @@ def init_db() -> None:
         ensure_column(db, "videos", "audio_filename", "TEXT")
         ensure_column(db, "videos", "audio_mime", "TEXT")
         ensure_column(db, "videos", "embedding", f"vector({EMBEDDING_DIM})")
+        ensure_column(db, "videos", "estimated_cost_usd", "DOUBLE PRECISION")
 
         # Full-text search replaces the old SQLite FTS5 virtual table + triggers:
         # a generated tsvector column kept in sync automatically, with a GIN index.

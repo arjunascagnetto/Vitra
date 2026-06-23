@@ -24,6 +24,9 @@ load_dotenv(BASE_DIR / ".env")
 
 DEFAULT_SUMMARY_MODEL = "gpt-5.5"
 EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+# Published OpenAI Whisper API price (USD per minute of audio). Override via env if
+# it changes. Transcription is the dominant, duration-driven cost of the pipeline.
+WHISPER_USD_PER_MINUTE = float(os.getenv("WHISPER_USD_PER_MINUTE", "0.006"))
 OPENAI_AUDIO_LIMIT_BYTES = 24 * 1024 * 1024
 # Keep embedding input well under the model's 8191-token limit (~4 chars/token).
 EMBEDDING_INPUT_CHARS = 24000
@@ -118,6 +121,34 @@ def get_video(video_id: int) -> dict[str, Any]:
     return video
 
 
+def estimate_transcription_cost(duration_seconds: Any) -> float | None:
+    # Whisper is billed per minute of audio; estimate from the source duration
+    # (known from metadata before any download/transcription happens).
+    try:
+        seconds = float(duration_seconds)
+    except (TypeError, ValueError):
+        return None
+    if seconds <= 0:
+        return None
+    return round((seconds / 60.0) * WHISPER_USD_PER_MINUTE, 4)
+
+
+@app.post("/api/videos/estimate")
+def estimate_video(url: str = Form(...)) -> dict[str, Any]:
+    url = url.strip()
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="Inserisci un URL http/https valido")
+    metadata = download_metadata(url)
+    duration = metadata.get("duration")
+    return {
+        "title": metadata.get("title"),
+        "duration": duration,
+        "estimated_cost_usd": estimate_transcription_cost(duration),
+        "currency": "USD",
+        "rate_per_minute": WHISPER_USD_PER_MINUTE,
+    }
+
+
 @app.post("/api/videos")
 def process_video(
     url: str = Form(...),
@@ -141,6 +172,7 @@ def process_video(
         summary = combined_summary_text(summary_data)
         category = categorize_video(transcript_text, summary, metadata)
         embedding = embed_text(build_embedding_text(metadata, summary, transcript_text))
+        estimated_cost = estimate_transcription_cost(metadata.get("duration"))
         saved_audio_path = persist_audio(prepared_audio_path, metadata)
         saved = save_video(
             url,
@@ -152,6 +184,7 @@ def process_video(
             language_hint,
             saved_audio_path,
             embedding,
+            estimated_cost,
         )
 
     return {"video": saved}
@@ -626,6 +659,7 @@ def save_video(
     language_hint: str,
     audio_path: Path,
     embedding: list[float] | None = None,
+    estimated_cost_usd: float | None = None,
 ) -> dict[str, Any]:
     audio_filename = audio_path.name
     summary = combined_summary_text(summary_data)
@@ -635,9 +669,10 @@ def save_video(
             INSERT INTO videos (
                 url, title, uploader, duration, thumbnail, webpage_url, language,
                 category, transcript, transcript_json, summary, summary_short, summary_long,
-                key_points_json, audio_path, audio_filename, audio_mime, embedding
+                key_points_json, audio_path, audio_filename, audio_mime, embedding,
+                estimated_cost_usd
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (
@@ -659,6 +694,7 @@ def save_video(
                 audio_filename,
                 "audio/mpeg",
                 embedding,
+                estimated_cost_usd,
             ),
         ).fetchone()["id"]
         db.commit()

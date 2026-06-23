@@ -53,8 +53,25 @@ function finishProcessing(message, isError = false) {
 
 els.form.addEventListener("submit", async (event) => {
   event.preventDefault();
-  startProcessing();
   const formData = new FormData(els.form);
+
+  // Cost estimate (real Whisper price, from the source duration) before any
+  // download/transcription. Ask for confirmation, since processing costs money.
+  let estimate;
+  try {
+    setStatus("Calcolo della stima di costo…");
+    const response = await fetch("/api/videos/estimate", { method: "POST", body: formData });
+    estimate = await readJson(response);
+  } catch (error) {
+    setStatus(error.message, true);
+    return;
+  }
+  if (!window.confirm(estimateMessage(estimate))) {
+    setStatus("Elaborazione annullata.");
+    return;
+  }
+
+  startProcessing();
   try {
     const response = await fetch("/api/videos", { method: "POST", body: formData });
     const data = await readJson(response);
@@ -66,6 +83,28 @@ els.form.addEventListener("submit", async (event) => {
     finishProcessing(error.message, true);
   }
 });
+
+function estimateMessage(estimate) {
+  const title = estimate.title || "Video";
+  if (estimate.estimated_cost_usd == null) {
+    return `${title}\n\nDurata non disponibile: impossibile stimare il costo di trascrizione.\n\nProcedere comunque con l'elaborazione?`;
+  }
+  const minutes = estimate.duration ? Math.round(estimate.duration / 60) : "?";
+  return (
+    `${title}\n\n` +
+    `Durata: ~${minutes} min\n` +
+    `Costo stimato di trascrizione: ${formatCost(estimate.estimated_cost_usd)} ` +
+    `(Whisper, ${formatCost(estimate.rate_per_minute)}/min)\n\n` +
+    `Procedere con l'elaborazione?`
+  );
+}
+
+function formatCost(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return "n/d";
+  if (num > 0 && num < 0.01) return "<$0.01";
+  return `$${num.toFixed(2)}`;
+}
 
 els.search.addEventListener("input", debounce(loadVideos, 250));
 els.categoryFilter.addEventListener("change", loadVideos);
@@ -182,7 +221,7 @@ function renderDetail() {
       <div>
         <span class="pill">${escapeHtml(video.category)}</span>
         <h2>${escapeHtml(video.title)}</h2>
-        <p class="meta">${escapeHtml(video.uploader || "")} ${video.webpage_url ? `· <a href="${escapeHtml(video.webpage_url)}" target="_blank" rel="noreferrer">Apri video</a>` : ""}</p>
+        <p class="meta">${escapeHtml(video.uploader || "")} ${video.webpage_url ? `· <a href="${escapeHtml(video.webpage_url)}" target="_blank" rel="noreferrer">Apri video</a>` : ""}${video.estimated_cost_usd != null ? ` · Costo stimato trascrizione: ${formatCost(video.estimated_cost_usd)}` : ""}</p>
       </div>
       <button class="icon-button" type="button" data-close aria-label="Chiudi">×</button>
     </div>
