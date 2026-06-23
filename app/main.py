@@ -39,6 +39,12 @@ EMBEDDING_USD_PER_1M = float(os.getenv("EMBEDDING_USD_PER_1M", "0.02"))
 TRANSCRIPT_TOKENS_PER_MINUTE = float(os.getenv("TRANSCRIPT_TOKENS_PER_MINUTE", "200"))
 SUMMARY_OUTPUT_TOKENS = int(os.getenv("SUMMARY_OUTPUT_TOKENS", "1500"))
 
+# Local transcription (faster-whisper). Selectable per request; "openai" uses the
+# Whisper API, "local" runs the model on this machine (free, no upload limit).
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "large-v3")
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "auto")
+WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "default")
+
 OPENAI_AUDIO_LIMIT_BYTES = 24 * 1024 * 1024
 # Keep embedding input well under the model's 8191-token limit (~4 chars/token).
 EMBEDDING_INPUT_CHARS = 24000
@@ -133,7 +139,9 @@ def get_video(video_id: int) -> dict[str, Any]:
     return video
 
 
-def estimate_costs(duration_seconds: Any) -> dict[str, float | None]:
+def estimate_costs(
+    duration_seconds: Any, transcription_backend: str = "openai"
+) -> dict[str, float | None]:
     # Estimate the per-stage USD cost from the source duration, known from metadata
     # before any download/transcription. Returns None values when duration is
     # unknown (live streams etc.), since every stage scales with audio length.
@@ -147,7 +155,8 @@ def estimate_costs(duration_seconds: Any) -> dict[str, float | None]:
     minutes = seconds / 60.0
     transcript_tokens = minutes * TRANSCRIPT_TOKENS_PER_MINUTE
 
-    transcription = minutes * WHISPER_USD_PER_MINUTE
+    # Local faster-whisper transcription is free; only the OpenAI API is billed.
+    transcription = 0.0 if transcription_backend == "local" else minutes * WHISPER_USD_PER_MINUTE
 
     # `summarize`: (capped) timestamped transcript in, bounded JSON summary out.
     # `categorize_video`: short transcript + summary extract in, tiny category out.
@@ -170,22 +179,26 @@ def estimate_costs(duration_seconds: Any) -> dict[str, float | None]:
 
 
 @app.post("/api/videos/estimate")
-def estimate_video(url: str = Form(...)) -> dict[str, Any]:
+def estimate_video(
+    url: str = Form(...),
+    transcription_backend: str = Form("openai"),
+) -> dict[str, Any]:
     url = url.strip()
     if not url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="Inserisci un URL http/https valido")
     metadata = download_metadata(url)
     duration = metadata.get("duration")
+    transcription_model = WHISPER_MODEL if transcription_backend == "local" else "whisper-1"
     return {
         "title": metadata.get("title"),
         "duration": duration,
         "currency": "USD",
         "models": {
-            "transcription": "whisper-1",
+            "transcription": transcription_model,
             "summary": SUMMARY_MODEL,
             "embedding": EMBEDDING_MODEL,
         },
-        "costs": estimate_costs(duration),
+        "costs": estimate_costs(duration, transcription_backend),
     }
 
 
@@ -193,10 +206,13 @@ def estimate_video(url: str = Form(...)) -> dict[str, Any]:
 def process_video(
     url: str = Form(...),
     language_hint: str = Form("auto"),
+    transcription_backend: str = Form("openai"),
 ) -> dict[str, Any]:
     url = url.strip()
     if not url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="Inserisci un URL http/https valido")
+    # Local transcription needs no API key, but summary/categorization/embedding
+    # still call OpenAI for now, so the key remains required.
     if not os.getenv("OPENAI_API_KEY"):
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY non configurata")
 
@@ -205,14 +221,16 @@ def process_video(
         metadata = download_metadata(url)
         audio_path = download_audio(url, tmpdir)
         prepared_audio_path = prepare_export_audio(audio_path, tmpdir)
-        transcript_segments = transcribe_audio_file(prepared_audio_path, tmpdir, language_hint)
+        transcript_segments = transcribe_audio_file(
+            prepared_audio_path, tmpdir, language_hint, transcription_backend
+        )
         transcript_text = segments_to_text(transcript_segments)
 
         summary_data = summarize(transcript_segments, metadata, language_hint)
         summary = combined_summary_text(summary_data)
         category = categorize_video(transcript_text, summary, metadata)
         embedding = embed_text(build_embedding_text(metadata, summary, transcript_text))
-        estimated_cost = estimate_costs(metadata.get("duration"))["total_usd"]
+        estimated_cost = estimate_costs(metadata.get("duration"), transcription_backend)["total_usd"]
         saved_audio_path = persist_audio(prepared_audio_path, metadata)
         saved = save_video(
             url,
@@ -403,12 +421,52 @@ def prepare_export_audio(audio_path: Path, tmpdir: Path) -> Path:
     return prepared
 
 
-def transcribe_audio_file(audio_path: Path, tmpdir: Path, language_hint: str) -> list[dict[str, Any]]:
+def transcribe_audio_file(
+    audio_path: Path, tmpdir: Path, language_hint: str, backend: str = "openai"
+) -> list[dict[str, Any]]:
+    if backend == "local":
+        # faster-whisper handles arbitrarily long files, so no chunking/size limit.
+        return transcribe_audio_local(audio_path, language_hint)
     chunks = prepare_audio_chunks(audio_path, tmpdir)
     transcript_segments: list[dict[str, Any]] = []
     for chunk_path, offset in chunks:
         transcript_segments.extend(transcribe_audio(chunk_path, language_hint, offset))
     return transcript_segments
+
+
+_local_whisper_model = None
+
+
+def get_local_whisper_model():
+    # Lazily load and cache the faster-whisper model (loading is expensive).
+    global _local_whisper_model
+    if _local_whisper_model is None:
+        # Importing torch (CUDA build) first loads its bundled CUDA libraries
+        # (cuBLAS/cuDNN) and registers their DLL directory, so CTranslate2 finds
+        # them on the GPU without any separate NVIDIA runtime packages.
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            pass
+        from faster_whisper import WhisperModel
+
+        _local_whisper_model = WhisperModel(
+            WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE
+        )
+    return _local_whisper_model
+
+
+def transcribe_audio_local(audio_path: Path, language_hint: str) -> list[dict[str, Any]]:
+    model = get_local_whisper_model()
+    language = None if language_hint == "auto" else language_hint
+    try:
+        segments, _info = model.transcribe(str(audio_path), language=language, vad_filter=True)
+        return [
+            {"start": float(seg.start), "end": float(seg.end), "text": seg.text}
+            for seg in segments
+        ]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Trascrizione locale fallita: {str(exc)}") from exc
 
 
 def prepare_audio_chunks(audio_path: Path, tmpdir: Path) -> list[tuple[Path, float]]:

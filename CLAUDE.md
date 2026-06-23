@@ -77,6 +77,12 @@ bundled imageio-ffmpeg binary, so audio download/import works on Windows.
   rows (the `embedding vector(N)` column dimension must match).
 - `DATABASE_URL` — defaults to `postgresql://postgres@localhost:5432/transcript`.
 - `TS_CONFIG` — Postgres text-search config for the FTS column; defaults to `italian`.
+- Local transcription (faster-whisper): `WHISPER_MODEL` (`large-v3`), `WHISPER_DEVICE`
+  (`auto`), `WHISPER_COMPUTE_TYPE` (`default`). GPU works via **torch (CUDA build,
+  cu124)** — `get_local_whisper_model` imports `torch` first so CTranslate2 finds
+  torch's bundled cuBLAS/cuDNN. Do **not** add the `nvidia-cublas/cudnn` DLL wheels;
+  torch provides them. Install torch from the CUDA index, e.g.
+  `pip install torch --index-url https://download.pytorch.org/whl/cu124`.
 - Cost-estimate prices (USD, real OpenAI rates, override if they change):
   `WHISPER_USD_PER_MINUTE` (0.006), `SUMMARY_USD_PER_1M_INPUT` (2.50),
   `SUMMARY_USD_PER_1M_OUTPUT` (15.0), `EMBEDDING_USD_PER_1M` (0.02). Token-billed
@@ -94,10 +100,14 @@ The whole backend is two files plus a static frontend.
      bundled imageio-ffmpeg binary — not as a library, not a system yt-dlp).
   2. `prepare_export_audio` / `convert_audio` — ffmpeg (from bundled
      `imageio-ffmpeg`, not system ffmpeg) re-encodes to **MP3 mono 16 kHz 32 kbps**.
-  3. `transcribe_audio_file` — if the file exceeds `OPENAI_AUDIO_LIMIT_BYTES`
-     (24 MB), `prepare_audio_chunks` splits it into time segments and each
-     chunk's timestamps are shifted by its offset so the merged transcript stays
-     globally timed. Whisper returns timestamped segments.
+  3. `transcribe_audio_file` — backend selectable per request via the
+     `transcription_backend` form field. `"openai"` (default) uses the Whisper API:
+     if the file exceeds `OPENAI_AUDIO_LIMIT_BYTES` (24 MB), `prepare_audio_chunks`
+     splits it and each chunk's timestamps are shifted by its offset so the merged
+     transcript stays globally timed. `"local"` runs faster-whisper
+     (`transcribe_audio_local`, model cached in `get_local_whisper_model`) on this
+     machine — free, no size limit, no chunking. Both return the same
+     `{start, end, text}` segments.
   4. `summarize` — one OpenAI JSON-mode call returns `summary_short`,
      `summary_long`, and `key_points` (each with `time_seconds`/`title`/`detail`).
      `normalize_summary_data` defends against malformed model output.
@@ -118,9 +128,12 @@ The whole backend is two files plus a static frontend.
   `DELETE /api/videos/{id}` removes the row and best-effort unlinks its MP3.
   `POST /api/videos/estimate` returns a per-stage USD cost breakdown
   (transcription/summary/embedding + total) from `estimate_costs`, computed from
-  the source duration *before* processing; the total is stored in
-  `estimated_cost_usd` on `save_video`. The frontend shows this estimate in a
-  confirmation dialog and requires confirmation before calling `POST /api/videos`.
+  the source duration *before* processing; with `transcription_backend=local` the
+  transcription cost is $0. The total is stored in `estimated_cost_usd` on
+  `save_video`. The frontend opens a settings dialog (`openSettings`, model backend
+  per phase + live cost) on "Processa" and requires confirmation before calling
+  `POST /api/videos`. Summary/embedding local backends are not wired yet (the
+  dialog's local options for them are disabled).
 
 - `app/database.py` — PostgreSQL (`DATABASE_URL`, default DB `transcript`) via
   `psycopg` 3 with `dict_row`; `register_vector` enables pgvector on each

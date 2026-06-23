@@ -426,6 +426,33 @@ button.secondary {
   background: var(--danger);
 }
 
+.settings-rows {
+  display: grid;
+  gap: 10px;
+  margin: 14px 0;
+}
+
+.settings-row {
+  display: grid;
+  grid-template-columns: 110px 1fr;
+  align-items: center;
+  gap: 12px;
+}
+
+.settings-row > span {
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.settings-row select {
+  width: 100%;
+}
+
+.settings-cost {
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+
 .cost-table {
   width: 100%;
   border-collapse: collapse;

@@ -15,6 +15,7 @@ const els = {
   detail: document.querySelector("#detail"),
   detailPanel: document.querySelector("#detail .detail"),
   confirm: document.querySelector("#confirm"),
+  settings: document.querySelector("#settings"),
   search: document.querySelector("#search"),
   categoryFilter: document.querySelector("#category-filter"),
 };
@@ -103,15 +104,12 @@ els.form.addEventListener("submit", async (event) => {
     setStatus(error.message, true);
     return;
   }
-  const proceed = await openConfirm({
-    title: estimate.title || "Stima di costo",
-    bodyHtml: estimateBodyHtml(estimate),
-    confirmLabel: "Processa",
-  });
-  if (!proceed) {
+  const choices = await openSettings(estimate);
+  if (!choices) {
     setStatus("Elaborazione annullata.");
     return;
   }
+  formData.set("transcription_backend", choices.transcription_backend);
 
   startProcessing();
   try {
@@ -126,35 +124,118 @@ els.form.addEventListener("submit", async (event) => {
   }
 });
 
-function estimateBodyHtml(estimate) {
-  const costs = estimate.costs || {};
-  if (costs.total_usd == null) {
-    return `
-      <p>Durata non disponibile: impossibile stimare il costo.</p>
-      <p>Vuoi procedere comunque con l'elaborazione?</p>
-    `;
+function costTableHtml(costs, models) {
+  if (!costs || costs.total_usd == null) {
+    return `<p class="confirm-note">Durata non disponibile: impossibile stimare il costo.</p>`;
   }
-  const models = estimate.models || {};
-  const minutes = estimate.duration ? Math.round(estimate.duration / 60) : "?";
+  models = models || {};
   const row = (label, model, value) => `
     <tr>
       <td>${escapeHtml(label)}${model ? ` <span class="cost-model">${escapeHtml(model)}</span>` : ""}</td>
       <td class="cost-value">${formatCost(value)}</td>
     </tr>`;
   return `
-    <p class="confirm-meta">Durata stimata: ~${minutes} min</p>
     <table class="cost-table">
       <tbody>
         ${row("Trascrizione", models.transcription, costs.transcription_usd)}
         ${row("Riassunti e categoria", models.summary, costs.summary_usd)}
         ${row("Embedding", models.embedding, costs.embedding_usd)}
       </tbody>
-      <tfoot>
-        ${row("Totale stimato", "", costs.total_usd)}
-      </tfoot>
-    </table>
-    <p class="confirm-note">Stima indicativa basata sui prezzi OpenAI e sulla durata del video.</p>
+      <tfoot>${row("Totale stimato", "", costs.total_usd)}</tfoot>
+    </table>`;
+}
+
+// Recompute the displayed costs when transcription runs locally (free).
+function adjustedCosts(costs, transcriptionLocal) {
+  if (!costs || costs.total_usd == null) return costs;
+  const transcription = transcriptionLocal ? 0 : costs.transcription_usd;
+  const total = (transcription || 0) + (costs.summary_usd || 0) + (costs.embedding_usd || 0);
+  return {
+    transcription_usd: transcription,
+    summary_usd: costs.summary_usd,
+    embedding_usd: costs.embedding_usd,
+    total_usd: Math.round(total * 10000) / 10000,
+  };
+}
+
+// Settings dialog opened on "Processa": choose model backend per phase and see the
+// cost update live. Summary/embedding local backends are not wired yet (disabled).
+function openSettings(estimate) {
+  const dlg = els.settings;
+  const body = dlg.querySelector(".settings-body");
+  const models = estimate.models || {};
+  const baseCosts = estimate.costs || {};
+  const minutes = estimate.duration ? Math.round(estimate.duration / 60) : "?";
+
+  body.innerHTML = `
+    <p class="confirm-meta">${escapeHtml(estimate.title || "Video")} · durata ~${minutes} min</p>
+    <div class="settings-rows">
+      <label class="settings-row">
+        <span>Trascrizione</span>
+        <select data-phase="transcription">
+          <option value="local">Locale · large-v3 (gratis)</option>
+          <option value="openai">Cloud · whisper-1</option>
+        </select>
+      </label>
+      <label class="settings-row">
+        <span>Riassunti</span>
+        <select data-phase="summary">
+          <option value="openai">Cloud · ${escapeHtml(models.summary || "gpt")}</option>
+          <option value="local" disabled>Locale (presto)</option>
+        </select>
+      </label>
+      <label class="settings-row">
+        <span>Embedding</span>
+        <select data-phase="embedding">
+          <option value="openai">Cloud · ${escapeHtml(models.embedding || "")}</option>
+          <option value="local" disabled>Locale (presto)</option>
+        </select>
+      </label>
+    </div>
+    <div class="settings-cost"></div>
+    <p class="confirm-note">La trascrizione locale gira su questa macchina ed è gratuita. Backend locale per riassunti/embedding in arrivo.</p>
   `;
+
+  const transcriptionSelect = body.querySelector('[data-phase="transcription"]');
+  transcriptionSelect.value = "local";
+  const costBox = body.querySelector(".settings-cost");
+  const renderCost = () => {
+    const local = transcriptionSelect.value === "local";
+    costBox.innerHTML = costTableHtml(adjustedCosts(baseCosts, local), {
+      transcription: local ? "large-v3" : "whisper-1",
+      summary: models.summary,
+      embedding: models.embedding,
+    });
+  };
+  transcriptionSelect.addEventListener("change", renderCost);
+  renderCost();
+
+  const ok = dlg.querySelector("[data-ok]");
+  const cancel = dlg.querySelector("[data-cancel]");
+  return new Promise((resolve) => {
+    const finish = (result) => {
+      ok.removeEventListener("click", onOk);
+      cancel.removeEventListener("click", onCancel);
+      dlg.removeEventListener("cancel", onDismiss);
+      dlg.removeEventListener("click", onBackdrop);
+      if (dlg.open) dlg.close();
+      resolve(result);
+    };
+    const onOk = () => finish({ transcription_backend: transcriptionSelect.value });
+    const onCancel = () => finish(null);
+    const onDismiss = (event) => {
+      event.preventDefault();
+      finish(null);
+    };
+    const onBackdrop = (event) => {
+      if (event.target === dlg) finish(null);
+    };
+    ok.addEventListener("click", onOk);
+    cancel.addEventListener("click", onCancel);
+    dlg.addEventListener("cancel", onDismiss);
+    dlg.addEventListener("click", onBackdrop);
+    dlg.showModal();
+  });
 }
 
 function formatCost(value) {

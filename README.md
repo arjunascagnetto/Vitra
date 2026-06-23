@@ -13,6 +13,15 @@ in **PostgreSQL** con ricerca full-text e ricerca vettoriale su embedding via **
 ffmpeg e yt-dlp non vanno installati a parte: ffmpeg è incluso via `imageio-ffmpeg`
 e yt-dlp è una dipendenza Python invocata come modulo (`python -m yt_dlp`).
 
+Per la **trascrizione locale su GPU** (faster-whisper) installa anche PyTorch con
+CUDA — porta con sé le librerie CUDA necessarie (niente DLL NVIDIA separate):
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu124
+```
+
+Senza GPU, imposta `WHISPER_DEVICE=cpu` (più lento) oppure usa la trascrizione cloud.
+
 ## Installazione rapida (auto installer)
 
 Assicurati che PostgreSQL sia in esecuzione, poi lancia l'installer dalla root del
@@ -93,9 +102,11 @@ Avvia con `uvicorn app.main:app --reload --host 127.0.0.1 --port 8000` e apri
 - Categorie automatiche per separare i video.
 - Ricerca full-text su titolo, autore, URL, categoria, trascrizione e riassunto.
 - Ricerca vettoriale sugli embedding (pgvector, distanza coseno) per la ricerca semantica (`?mode=semantic`).
-- Stima di costo prima dell'elaborazione, con dettaglio per voce (trascrizione
-  Whisper, riassunti gpt-5.4, embedding) e totale, e conferma richiesta prima di
-  avviare il processing.
+- Trascrizione **locale** con faster-whisper (`large-v3`, GPU) oppure **cloud**
+  (OpenAI `whisper-1`), selezionabile dal pannello impostazioni a ogni elaborazione.
+- Stima di costo prima dell'elaborazione, con dettaglio per voce (trascrizione,
+  riassunti gpt-5.4, embedding) e totale, e conferma richiesta prima di avviare il
+  processing. Con la trascrizione locale il costo di trascrizione è $0.
 - Barra di stato durante l'elaborazione del video.
 - Vista per locandine raggruppate per categoria, con eliminazione singola (cestino).
 - Scheda video con player audio.
