@@ -106,6 +106,9 @@ def get_video(video_id: int) -> dict[str, Any]:
     if not row:
         raise HTTPException(status_code=404, detail="Video non trovato")
     video = row_to_dict(row)
+    # pgvector returns `embedding` as a numpy.ndarray, which is not JSON
+    # serializable; it is internal and never needed by the frontend.
+    video.pop("embedding", None)
     video["transcript_json"] = json.loads(video["transcript_json"])
     video["key_points"] = json.loads(video.get("key_points_json") or "[]")
     if not video.get("summary_short"):
