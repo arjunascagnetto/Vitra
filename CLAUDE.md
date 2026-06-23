@@ -58,18 +58,12 @@ psql is at `C:\Program Files\PostgreSQL\16\bin\psql.exe`. Quick check:
 "C:\Program Files\PostgreSQL\16\bin\psql.exe" -h localhost -U postgres -d transcript -w -c "\d videos"
 ```
 
-### Platform caveat (Linux paths hardcoded in code)
+### Platform caveat (Linux path hardcoded in code)
 
-The pipeline was authored on Linux and hardcodes two Linux paths that break on
-Windows — fix these before running the full pipeline here:
-
-- `run_yt_dlp` (`app/main.py`) invokes `.venv/bin/yt-dlp`. On Windows that path
-  doesn't exist, and `yt-dlp` is not installed in this venv at all (only
-  `python.exe`/`pythonw.exe` are in `.venv\Scripts`). `yt-dlp` is in
-  `requirements.txt`; install it and call it via `python -m yt_dlp` or the
-  `Scripts\yt-dlp.exe` shim rather than the hardcoded POSIX path.
-- `write_pdf` loads `/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf` (see PDF
-  export caveat below).
+`write_pdf` loads `/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf` (Linux path),
+so PDF export still needs that font present — see PDF export caveat below. The old
+yt-dlp Linux-path bug is fixed: `run_yt_dlp` now calls `python -m yt_dlp` with the
+bundled imageio-ffmpeg binary, so audio download/import works on Windows.
 
 ## Configuration
 
@@ -91,8 +85,9 @@ The whole backend is two files plus a static frontend.
 - `app/main.py` — all API routes and the processing pipeline. `POST /api/videos`
   runs the full chain synchronously inside one request (no background queue), all
   within a single `TemporaryDirectory`:
-  1. `download_metadata` / `download_audio` via `yt-dlp` (invoked as the venv
-     binary at `.venv/bin/yt-dlp`, not as a library).
+  1. `download_metadata` / `download_audio` via `yt-dlp` (invoked through
+     `run_yt_dlp` as `python -m yt_dlp`, with `--ffmpeg-location` set to the
+     bundled imageio-ffmpeg binary — not as a library, not a system yt-dlp).
   2. `prepare_export_audio` / `convert_audio` — ffmpeg (from bundled
      `imageio-ffmpeg`, not system ffmpeg) re-encodes to **MP3 mono 16 kHz 32 kbps**.
   3. `transcribe_audio_file` — if the file exceeds `OPENAI_AUDIO_LIMIT_BYTES`

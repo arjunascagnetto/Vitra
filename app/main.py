@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Annotated, Any
@@ -235,8 +236,19 @@ def embed_text(text: str) -> list[float]:
 
 
 def run_yt_dlp(args: list[str]) -> subprocess.CompletedProcess[str]:
+    # Invoke yt-dlp as a module with the current interpreter so it works on any
+    # platform (the old hardcoded .venv/bin/yt-dlp path was Linux-only). Point it
+    # at the bundled imageio-ffmpeg binary so post-processing uses our ffmpeg
+    # rather than depending on a system install.
     return subprocess.run(
-        [str(BASE_DIR / ".venv" / "bin" / "yt-dlp"), *args],
+        [
+            sys.executable,
+            "-m",
+            "yt_dlp",
+            "--ffmpeg-location",
+            imageio_ffmpeg.get_ffmpeg_exe(),
+            *args,
+        ],
         check=True,
         text=True,
         capture_output=True,
