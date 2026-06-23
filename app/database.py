@@ -1,28 +1,47 @@
 from __future__ import annotations
 
-import sqlite3
+import os
 from pathlib import Path
 from typing import Any
+
+import psycopg
+from pgvector.psycopg import register_vector
+from psycopg.rows import dict_row
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
-DB_PATH = DATA_DIR / "videos.db"
+
+# PostgreSQL connection. Defaults to the local trust-auth instance; override with
+# DATABASE_URL in .env. The pipeline stores transcripts, full-text search vectors
+# (Italian config) and pgvector embeddings in a single `videos` table.
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://postgres@localhost:5432/transcript",
+)
+
+# Dimensionality of OpenAI text-embedding-3-small. Must match EMBEDDING_MODEL in
+# app.main. Changing the model means changing this and re-embedding every row.
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1536"))
+
+# Postgres text-search configuration used for the generated tsvector. Content is
+# Italian; override with TS_CONFIG if a corpus is in another language.
+TS_CONFIG = os.getenv("TS_CONFIG", "italian")
 
 
-def get_connection() -> sqlite3.Connection:
-    DATA_DIR.mkdir(exist_ok=True)
-    connection = sqlite3.connect(DB_PATH)
-    connection.row_factory = sqlite3.Row
+def get_connection() -> psycopg.Connection:
+    connection = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+    register_vector(connection)
     return connection
 
 
 def init_db() -> None:
     with get_connection() as db:
+        db.execute("CREATE EXTENSION IF NOT EXISTS vector")
         db.execute(
-            """
+            f"""
             CREATE TABLE IF NOT EXISTS videos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id BIGSERIAL PRIMARY KEY,
                 url TEXT NOT NULL,
                 title TEXT NOT NULL,
                 uploader TEXT,
@@ -40,59 +59,61 @@ def init_db() -> None:
                 audio_path TEXT,
                 audio_filename TEXT,
                 audio_mime TEXT,
+                embedding vector({EMBEDDING_DIM}),
                 status TEXT NOT NULL DEFAULT 'done',
                 error TEXT,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )
             """
         )
-        ensure_column(db, "videos", "audio_path", "TEXT")
-        ensure_column(db, "videos", "audio_filename", "TEXT")
-        ensure_column(db, "videos", "audio_mime", "TEXT")
+        # Idempotent migrations for tables created by an older schema.
         ensure_column(db, "videos", "summary_short", "TEXT")
         ensure_column(db, "videos", "summary_long", "TEXT")
         ensure_column(db, "videos", "key_points_json", "TEXT")
+        ensure_column(db, "videos", "audio_path", "TEXT")
+        ensure_column(db, "videos", "audio_filename", "TEXT")
+        ensure_column(db, "videos", "audio_mime", "TEXT")
+        ensure_column(db, "videos", "embedding", f"vector({EMBEDDING_DIM})")
+
+        # Full-text search replaces the old SQLite FTS5 virtual table + triggers:
+        # a generated tsvector column kept in sync automatically, with a GIN index.
         db.execute(
-            """
-            CREATE VIRTUAL TABLE IF NOT EXISTS video_search
-            USING fts5(title, uploader, url, category, transcript, summary, content='videos', content_rowid='id')
+            f"""
+            ALTER TABLE videos
+            ADD COLUMN IF NOT EXISTS search_vector tsvector
+            GENERATED ALWAYS AS (
+                to_tsvector(
+                    '{TS_CONFIG}',
+                    coalesce(title, '') || ' ' ||
+                    coalesce(uploader, '') || ' ' ||
+                    coalesce(url, '') || ' ' ||
+                    coalesce(category, '') || ' ' ||
+                    coalesce(transcript, '') || ' ' ||
+                    coalesce(summary, '')
+                )
+            ) STORED
             """
         )
         db.execute(
-            """
-            CREATE TRIGGER IF NOT EXISTS videos_ai AFTER INSERT ON videos BEGIN
-                INSERT INTO video_search(rowid, title, uploader, url, category, transcript, summary)
-                VALUES (new.id, new.title, new.uploader, new.url, new.category, new.transcript, new.summary);
-            END
-            """
+            "CREATE INDEX IF NOT EXISTS videos_search_idx ON videos USING GIN (search_vector)"
         )
+        # IVFFlat needs rows present before it can be built well; cosine distance
+        # matches how query embeddings are compared in app.main.search_semantic.
         db.execute(
             """
-            CREATE TRIGGER IF NOT EXISTS videos_au AFTER UPDATE ON videos BEGIN
-                INSERT INTO video_search(video_search, rowid, title, uploader, url, category, transcript, summary)
-                VALUES('delete', old.id, old.title, old.uploader, old.url, old.category, old.transcript, old.summary);
-                INSERT INTO video_search(rowid, title, uploader, url, category, transcript, summary)
-                VALUES (new.id, new.title, new.uploader, new.url, new.category, new.transcript, new.summary);
-            END
-            """
-        )
-        db.execute(
-            """
-            CREATE TRIGGER IF NOT EXISTS videos_ad AFTER DELETE ON videos BEGIN
-                INSERT INTO video_search(video_search, rowid, title, uploader, url, category, transcript, summary)
-                VALUES('delete', old.id, old.title, old.uploader, old.url, old.category, old.transcript, old.summary);
-            END
+            CREATE INDEX IF NOT EXISTS videos_embedding_idx
+            ON videos USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)
             """
         )
         db.commit()
 
 
-def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
-    return {key: row[key] for key in row.keys()}
+def row_to_dict(row: Any) -> dict[str, Any]:
+    # Rows already arrive as dicts via dict_row; copy to a plain dict so callers
+    # can mutate freely (pop/replace keys) without touching the cursor row.
+    return dict(row)
 
 
-def ensure_column(db: sqlite3.Connection, table: str, column: str, definition: str) -> None:
-    columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
-    if column not in columns:
-        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+def ensure_column(db: psycopg.Connection, table: str, column: str, definition: str) -> None:
+    db.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {definition}")

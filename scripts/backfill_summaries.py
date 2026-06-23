@@ -38,12 +38,12 @@ def main() -> None:
             db.execute(
                 """
                 UPDATE videos
-                SET summary = ?,
-                    summary_short = ?,
-                    summary_long = ?,
-                    key_points_json = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
+                SET summary = %s,
+                    summary_short = %s,
+                    summary_long = %s,
+                    key_points_json = %s,
+                    updated_at = now()
+                WHERE id = %s
                 """,
                 (
                     combined_summary_text(summary_data),

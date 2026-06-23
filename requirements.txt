@@ -5,3 +5,5 @@ openai==1.59.7
 yt-dlp==2026.6.9
 fpdf2==2.8.2
 imageio-ffmpeg==0.6.0
+psycopg[binary]==3.2.3
+pgvector==0.3.6

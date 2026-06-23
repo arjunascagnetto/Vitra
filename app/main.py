@@ -16,13 +16,16 @@ import imageio_ffmpeg
 from openai import OpenAI
 from dotenv import load_dotenv
 
-from .database import BASE_DIR, DATA_DIR, get_connection, init_db, row_to_dict
+from .database import BASE_DIR, DATA_DIR, TS_CONFIG, get_connection, init_db, row_to_dict
 
 
 load_dotenv(BASE_DIR / ".env")
 
 DEFAULT_SUMMARY_MODEL = "gpt-5.5"
+EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 OPENAI_AUDIO_LIMIT_BYTES = 24 * 1024 * 1024
+# Keep embedding input well under the model's 8191-token limit (~4 chars/token).
+EMBEDDING_INPUT_CHARS = 24000
 AUDIO_DIR = DATA_DIR / "audio"
 
 app = FastAPI(title="Video Transcript GUI")
@@ -51,28 +54,38 @@ def index() -> FileResponse:
 def list_videos(
     q: Annotated[str, Query(max_length=200)] = "",
     category: Annotated[str, Query(max_length=120)] = "",
+    mode: Annotated[str, Query(max_length=20)] = "keyword",
 ) -> dict[str, Any]:
+    columns = (
+        "videos.id, videos.url, videos.title, videos.uploader, videos.duration, "
+        "videos.thumbnail, videos.webpage_url, videos.language, videos.category, "
+        "videos.summary, videos.created_at, videos.updated_at"
+    )
     with get_connection() as db:
         params: list[Any] = []
         where: list[str] = []
-        join = ""
-        if q.strip():
-            join = "JOIN video_search ON video_search.rowid = videos.id"
-            where.append("video_search MATCH ?")
-            params.append(fts_query(q))
+        # Semantic search: order rows by cosine distance to the query embedding
+        # (pgvector). Falls back to keyword search if the query is empty.
+        if mode == "semantic" and q.strip():
+            query_embedding = embed_text(q.strip())
+            order_by = "videos.embedding <=> %s::vector"
+            params.append(query_embedding)
+            where.append("videos.embedding IS NOT NULL")
+        else:
+            order_by = "videos.created_at DESC"
+            if q.strip():
+                where.append(f"videos.search_vector @@ to_tsquery('{TS_CONFIG}', %s)")
+                params.append(fts_query(q))
         if category.strip():
-            where.append("videos.category = ?")
+            where.append("videos.category = %s")
             params.append(category.strip())
         clause = f"WHERE {' AND '.join(where)}" if where else ""
         rows = db.execute(
             f"""
-            SELECT videos.id, videos.url, videos.title, videos.uploader, videos.duration,
-                   videos.thumbnail, videos.webpage_url, videos.language, videos.category,
-                   videos.summary, videos.created_at, videos.updated_at
+            SELECT {columns}
             FROM videos
-            {join}
             {clause}
-            ORDER BY videos.created_at DESC
+            ORDER BY {order_by}
             """,
             params,
         ).fetchall()
@@ -88,7 +101,7 @@ def list_videos(
 @app.get("/api/videos/{video_id}")
 def get_video(video_id: int) -> dict[str, Any]:
     with get_connection() as db:
-        row = db.execute("SELECT * FROM videos WHERE id = ?", (video_id,)).fetchone()
+        row = db.execute("SELECT * FROM videos WHERE id = %s", (video_id,)).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Video non trovato")
     video = row_to_dict(row)
@@ -123,6 +136,7 @@ def process_video(
         summary_data = summarize(transcript_segments, metadata, language_hint)
         summary = combined_summary_text(summary_data)
         category = categorize_video(transcript_text, summary, metadata)
+        embedding = embed_text(build_embedding_text(metadata, summary, transcript_text))
         saved_audio_path = persist_audio(prepared_audio_path, metadata)
         saved = save_video(
             url,
@@ -133,6 +147,7 @@ def process_video(
             summary_data,
             language_hint,
             saved_audio_path,
+            embedding,
         )
 
     return {"video": saved}
@@ -142,7 +157,7 @@ def process_video(
 def download_video_audio(video_id: int) -> FileResponse:
     with get_connection() as db:
         row = db.execute(
-            "SELECT title, audio_path, audio_filename, audio_mime FROM videos WHERE id = ?",
+            "SELECT title, audio_path, audio_filename, audio_mime FROM videos WHERE id = %s",
             (video_id,),
         ).fetchone()
     if not row:
@@ -167,7 +182,7 @@ def export_video(video_id: int, kind: str, fmt: str) -> Response:
         raise HTTPException(status_code=400, detail="JSON disponibile solo per la trascrizione")
 
     with get_connection() as db:
-        row = db.execute("SELECT * FROM videos WHERE id = ?", (video_id,)).fetchone()
+        row = db.execute("SELECT * FROM videos WHERE id = %s", (video_id,)).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Video non trovato")
     video = row_to_dict(row)
@@ -192,12 +207,31 @@ def export_video(video_id: int, kind: str, fmt: str) -> Response:
 
 
 def fts_query(value: str) -> str:
+    # Build a Postgres to_tsquery string with prefix matching, OR-joining terms
+    # (mirrors the old SQLite `term*` behaviour). Sanitised so user input cannot
+    # inject tsquery operators.
     terms = []
     for raw_term in value.strip().split():
         term = "".join(char for char in raw_term if char.isalnum() or char in ("_", "-"))
         if term:
-            terms.append(f"{term}*")
-    return " OR ".join(terms) or '""'
+            terms.append(f"{term}:*")
+    return " | ".join(terms) or "''"
+
+
+def build_embedding_text(metadata: dict[str, Any], summary: str, transcript_text: str) -> str:
+    title = metadata.get("title") or ""
+    combined = f"{title}\n{summary}\n{transcript_text}".strip()
+    return combined[:EMBEDDING_INPUT_CHARS]
+
+
+def embed_text(text: str) -> list[float]:
+    client = OpenAI()
+    cleaned = (text or "").strip()[:EMBEDDING_INPUT_CHARS] or " "
+    try:
+        response = client.embeddings.create(model=EMBEDDING_MODEL, input=cleaned)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Embedding OpenAI fallito: {str(exc)}") from exc
+    return response.data[0].embedding
 
 
 def run_yt_dlp(args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -530,18 +564,20 @@ def save_video(
     summary_data: dict[str, Any],
     language_hint: str,
     audio_path: Path,
+    embedding: list[float] | None = None,
 ) -> dict[str, Any]:
     audio_filename = audio_path.name
     summary = combined_summary_text(summary_data)
     with get_connection() as db:
-        cursor = db.execute(
+        new_id = db.execute(
             """
             INSERT INTO videos (
                 url, title, uploader, duration, thumbnail, webpage_url, language,
                 category, transcript, transcript_json, summary, summary_short, summary_long,
-                key_points_json, audio_path, audio_filename, audio_mime
+                key_points_json, audio_path, audio_filename, audio_mime, embedding
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
             """,
             (
                 url,
@@ -561,12 +597,14 @@ def save_video(
                 str(audio_path),
                 audio_filename,
                 "audio/mpeg",
+                embedding,
             ),
-        )
+        ).fetchone()["id"]
         db.commit()
-        row = db.execute("SELECT * FROM videos WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        row = db.execute("SELECT * FROM videos WHERE id = %s", (new_id,)).fetchone()
     saved = row_to_dict(row)
     saved.pop("transcript_json", None)
+    saved.pop("embedding", None)
     return saved
 
 
