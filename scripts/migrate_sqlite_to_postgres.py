@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.database import DATA_DIR, get_connection, init_db
-from app.main import build_embedding_text, embed_text
+from app.main import build_embedding_text, embed_text, store_audio_path
 
 SQLITE_PATH = DATA_DIR / "videos.db"
 
@@ -57,6 +57,12 @@ def main() -> None:
                 skipped += 1
                 print(f"SKIP (gia presente): {data['title']}")
                 continue
+
+            # The legacy SQLite audio_path may be absolute and from another machine.
+            # Rewrite it to a project-relative path when the MP3 is present locally.
+            audio_filename = data.get("audio_filename")
+            if audio_filename and (DATA_DIR / "audio" / audio_filename).exists():
+                data["audio_path"] = store_audio_path(DATA_DIR / "audio" / audio_filename)
 
             metadata = {"title": data.get("title")}
             embedding = embed_text(

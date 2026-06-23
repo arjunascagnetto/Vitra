@@ -103,11 +103,15 @@ The whole backend is two files plus a static frontend.
      title + summary + transcript (truncated to `EMBEDDING_INPUT_CHARS`), stored
      in the `embedding` pgvector column.
   7. `persist_audio` copies the MP3 into `data/audio/`; `save_video` writes the row
-     (`INSERT ... RETURNING id`).
+     (`INSERT ... RETURNING id`). `audio_path` is stored **relative to the project
+     root** (POSIX separators) via `store_audio_path`, so the DB is portable across
+     machines; `resolve_audio_path` resolves it back (relative→`BASE_DIR`, absolute
+     for legacy rows, else falls back to `data/audio/<audio_filename>`).
 
   `GET /api/videos` supports two search modes via `?mode=`: `keyword` (default,
   Postgres FTS over `search_vector`) and `semantic` (pgvector cosine distance,
   `embedding <=> %s::vector`, ordering by nearest query embedding).
+  `DELETE /api/videos/{id}` removes the row and best-effort unlinks its MP3.
 
 - `app/database.py` — PostgreSQL (`DATABASE_URL`, default DB `transcript`) via
   `psycopg` 3 with `dict_row`; `register_vector` enables pgvector on each
@@ -119,7 +123,10 @@ The whole backend is two files plus a static frontend.
 
 - `static/` — vanilla JS frontend (`app.js`, `index.html`, `styles.css`); the
   detail modal embeds an audio player and key points seek the player by
-  `time_seconds`. Mounted at `/static`.
+  `time_seconds`. Posters carry a trash button (`deleteVideo`); during import an
+  indeterminate progress bar advances timed stage messages (`PROCESSING_STAGES`)
+  since the backend processes synchronously and reports no real progress. Mounted
+  at `/static`.
 
 ### Key design rules
 
@@ -135,7 +142,9 @@ The whole backend is two files plus a static frontend.
 
 Video records live in PostgreSQL (DB `transcript`). Runtime files under `data/`
 are local and git-ignored: the legacy `data/videos.db` (SQLite, now only a
-migration source), `data/audio/` MP3s, and generated export PDFs.
+migration source), `data/audio/` MP3s, and generated export PDFs. Paths stored in
+the DB (`audio_path`) are kept **relative to the project root** — don't write
+absolute paths back.
 
 ## PDF export caveat
 

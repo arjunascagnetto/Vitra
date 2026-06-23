@@ -157,6 +157,54 @@ def process_video(
     return {"video": saved}
 
 
+@app.delete("/api/videos/{video_id}")
+def delete_video(video_id: int) -> dict[str, Any]:
+    with get_connection() as db:
+        row = db.execute(
+            "SELECT audio_path FROM videos WHERE id = %s", (video_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Video non trovato")
+        db.execute("DELETE FROM videos WHERE id = %s", (video_id,))
+        db.commit()
+    # Best-effort cleanup of the stored MP3; missing file is not an error.
+    audio_path = row.get("audio_path")
+    if audio_path:
+        try:
+            Path(audio_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+    return {"deleted": video_id}
+
+
+def store_audio_path(path: Path) -> str:
+    # Persist audio paths relative to the project root (POSIX separators) so the
+    # DB stays portable across machines/OSes. Falls back to the absolute string
+    # only if the file lives outside the project tree.
+    try:
+        return path.resolve().relative_to(BASE_DIR).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def resolve_audio_path(audio_path: str | None, audio_filename: str | None) -> Path | None:
+    # Prefer the stored path (relative to project root, or absolute for legacy
+    # rows), but fall back to data/audio/<filename> so rows whose audio_path
+    # points at another machine still resolve as long as the MP3 was copied into
+    # data/audio.
+    if audio_path:
+        candidate = Path(audio_path)
+        if not candidate.is_absolute():
+            candidate = BASE_DIR / candidate
+        if candidate.exists():
+            return candidate
+    if audio_filename:
+        local = AUDIO_DIR / audio_filename
+        if local.exists():
+            return local
+    return None
+
+
 @app.get("/api/videos/{video_id}/audio")
 def download_video_audio(video_id: int) -> FileResponse:
     with get_connection() as db:
@@ -167,10 +215,8 @@ def download_video_audio(video_id: int) -> FileResponse:
     if not row:
         raise HTTPException(status_code=404, detail="Video non trovato")
     video = row_to_dict(row)
-    if not video.get("audio_path"):
-        raise HTTPException(status_code=404, detail="Audio non salvato per questo video")
-    audio_path = Path(video["audio_path"])
-    if not audio_path.exists():
+    audio_path = resolve_audio_path(video.get("audio_path"), video.get("audio_filename"))
+    if audio_path is None:
         raise HTTPException(status_code=404, detail="File audio non trovato su disco")
     filename = video.get("audio_filename") or f"{safe_filename(video['title'])}.mp3"
     return FileResponse(audio_path, media_type=video.get("audio_mime") or "audio/mpeg", filename=filename)
@@ -609,7 +655,7 @@ def save_video(
                 summary_data.get("summary_short", ""),
                 summary_data.get("summary_long", ""),
                 json.dumps(summary_data.get("key_points", []), ensure_ascii=False),
-                str(audio_path),
+                store_audio_path(audio_path),
                 audio_filename,
                 "audio/mpeg",
                 embedding,

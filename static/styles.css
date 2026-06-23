@@ -146,6 +146,36 @@ button.secondary {
   color: var(--danger);
 }
 
+.progress {
+  grid-column: 2;
+  height: 6px;
+  margin-top: 8px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+
+.progress[hidden] {
+  display: none;
+}
+
+.progress-bar {
+  width: 38%;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--accent-dark), var(--accent));
+  animation: progress-slide 1.3s ease-in-out infinite;
+}
+
+@keyframes progress-slide {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(280%);
+  }
+}
+
 .toolbar input,
 .toolbar select {
   background: #151a1b;
@@ -239,6 +269,35 @@ button.secondary {
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
+}
+
+.poster-delete {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-color: rgba(255, 138, 122, 0.5);
+  border-radius: 6px;
+  background: rgba(8, 11, 12, 0.72);
+  color: var(--danger);
+  opacity: 0;
+  transition: opacity 0.12s ease, background 0.12s ease;
+}
+
+.poster:hover .poster-delete,
+.poster:focus-within .poster-delete {
+  opacity: 1;
+}
+
+.poster-delete:hover {
+  background: var(--danger);
+  color: #2a0b07;
+  border-color: var(--danger);
 }
 
 .pill {
@@ -398,7 +457,8 @@ button.secondary {
     grid-template-columns: 1fr;
   }
 
-  .status {
+  .status,
+  .progress {
     grid-column: 1;
   }
 

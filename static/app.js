@@ -8,7 +8,9 @@ const state = {
 
 const els = {
   form: document.querySelector("#video-form"),
+  submit: document.querySelector("#video-form button[type=submit]"),
   status: document.querySelector("#status"),
+  progress: document.querySelector("#progress"),
   grid: document.querySelector("#grid"),
   detail: document.querySelector("#detail"),
   detailPanel: document.querySelector("#detail .detail"),
@@ -16,9 +18,42 @@ const els = {
   categoryFilter: document.querySelector("#category-filter"),
 };
 
+// Backend processing is a single synchronous request, so we can't report real
+// progress. Show an indeterminate bar and advance through the typical pipeline
+// stages on a timer for feedback. The last stage stays put until the request ends.
+const PROCESSING_STAGES = [
+  "Download dell'audio…",
+  "Conversione audio…",
+  "Trascrizione con Whisper… (per video lunghi può richiedere alcuni minuti)",
+  "Generazione di riassunto e categoria…",
+  "Calcolo dell'embedding…",
+  "Salvataggio nel database…",
+];
+let processingTimer = null;
+
+function startProcessing() {
+  let stage = 0;
+  els.submit.disabled = true;
+  els.progress.hidden = false;
+  setStatus(PROCESSING_STAGES[0]);
+  clearInterval(processingTimer);
+  processingTimer = setInterval(() => {
+    stage = Math.min(stage + 1, PROCESSING_STAGES.length - 1);
+    setStatus(PROCESSING_STAGES[stage]);
+  }, 6000);
+}
+
+function finishProcessing(message, isError = false) {
+  clearInterval(processingTimer);
+  processingTimer = null;
+  els.progress.hidden = true;
+  els.submit.disabled = false;
+  setStatus(message, isError);
+}
+
 els.form.addEventListener("submit", async (event) => {
   event.preventDefault();
-  setStatus("Elaborazione in corso. Per video lunghi può richiedere alcuni minuti.");
+  startProcessing();
   const formData = new FormData(els.form);
   try {
     const response = await fetch("/api/videos", { method: "POST", body: formData });
@@ -26,9 +61,9 @@ els.form.addEventListener("submit", async (event) => {
     state.selectedId = data.video.id;
     await loadVideos();
     await selectVideo(data.video.id);
-    setStatus("Video elaborato e salvato nel database.");
+    finishProcessing("Video elaborato e salvato nel database.");
   } catch (error) {
-    setStatus(error.message, true);
+    finishProcessing(error.message, true);
   }
 });
 
@@ -78,23 +113,38 @@ function renderGrid() {
     `;
     const posterGrid = section.querySelector(".poster-grid");
     for (const video of videos) {
-      const poster = document.createElement("button");
-      poster.type = "button";
+      const poster = document.createElement("div");
       poster.className = `poster${video.id === state.selectedId ? " selected" : ""}`;
       poster.title = video.title;
+      poster.setAttribute("role", "button");
+      poster.tabIndex = 0;
       poster.addEventListener("click", () => selectVideo(video.id));
+      poster.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          selectVideo(video.id);
+        }
+      });
       const thumb = video.thumbnail
         ? `<img class="thumb" src="${escapeHtml(video.thumbnail)}" alt="${escapeHtml(video.title)}">`
         : '<div class="thumb"></div>';
       poster.innerHTML = `
         ${thumb}
         <span class="poster-title">${escapeHtml(video.title)}</span>
+        <button type="button" class="poster-delete" aria-label="Elimina" title="Elimina">${TRASH_ICON}</button>
       `;
+      poster.querySelector(".poster-delete").addEventListener("click", (event) => {
+        event.stopPropagation();
+        deleteVideo(video.id, video.title);
+      });
       posterGrid.append(poster);
     }
     els.grid.append(section);
   }
 }
+
+const TRASH_ICON =
+  '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path><path d="M10 11v6"></path><path d="M14 11v6"></path><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"></path></svg>';
 
 async function selectVideo(id) {
   state.selectedId = id;
@@ -104,6 +154,23 @@ async function selectVideo(id) {
   renderGrid();
   renderDetail();
   if (!els.detail.open) els.detail.showModal();
+}
+
+async function deleteVideo(id, title) {
+  if (!confirm(`Eliminare definitivamente "${title}"?`)) return;
+  try {
+    const response = await fetch(`/api/videos/${id}`, { method: "DELETE" });
+    await readJson(response);
+    if (state.selectedId === id) {
+      state.selectedId = null;
+      state.selectedVideo = null;
+      if (els.detail.open) els.detail.close();
+    }
+    await loadVideos();
+    setStatus("Contenuto eliminato.");
+  } catch (error) {
+    setStatus(error.message, true);
+  }
 }
 
 function renderDetail() {
