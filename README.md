@@ -104,6 +104,10 @@ Avvia con `uvicorn app.main:app --reload --host 127.0.0.1 --port 8000` e apri
 - Ricerca vettoriale sugli embedding (pgvector, distanza coseno) per la ricerca semantica (`?mode=semantic`).
 - Trascrizione **locale** con faster-whisper (`large-v3`, GPU) oppure **cloud**
   (OpenAI `whisper-1`), selezionabile dal pannello impostazioni a ogni elaborazione.
+- **Chat per-video** alimentata da LLM (gpt-5.4), ancorata alla trascrizione/riassunto
+  e con cronologia salvata nel DB.
+- Video **non in italiano** (es. russo da VK/`vkvideo.ru`): trascrizione nell'originale,
+  **traduzione italiana per-segmento** (tab Traduzione), riassunti corti/lunghi in italiano.
 - Stima di costo prima dell'elaborazione, con dettaglio per voce (trascrizione,
   riassunti gpt-5.4, embedding) e totale, e conferma richiesta prima di avviare il
   processing. Con la trascrizione locale il costo di trascrizione è $0.

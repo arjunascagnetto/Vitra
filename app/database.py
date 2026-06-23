@@ -76,6 +76,8 @@ def init_db() -> None:
         ensure_column(db, "videos", "audio_mime", "TEXT")
         ensure_column(db, "videos", "embedding", f"vector({EMBEDDING_DIM})")
         ensure_column(db, "videos", "estimated_cost_usd", "DOUBLE PRECISION")
+        # Per-segment Italian translation ([{start,end,text}]); null for Italian sources.
+        ensure_column(db, "videos", "translation_json", "TEXT")
 
         # Full-text search replaces the old SQLite FTS5 virtual table + triggers:
         # a generated tsvector column kept in sync automatically, with a GIN index.
@@ -106,6 +108,21 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS videos_embedding_idx
             ON videos USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)
             """
+        )
+        # Per-video chat history; cascades when a video is deleted.
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS video_messages (
+                id BIGSERIAL PRIMARY KEY,
+                video_id BIGINT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS video_messages_video_idx ON video_messages(video_id)"
         )
         db.commit()
 

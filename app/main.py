@@ -132,6 +132,7 @@ def get_video(video_id: int) -> dict[str, Any]:
     video.pop("embedding", None)
     video["transcript_json"] = json.loads(video["transcript_json"])
     video["key_points"] = json.loads(video.get("key_points_json") or "[]")
+    video["translation"] = json.loads(video.get("translation_json") or "[]")
     if not video.get("summary_short"):
         video["summary_short"] = video.get("summary", "")
     if not video.get("summary_long"):
@@ -139,8 +140,99 @@ def get_video(video_id: int) -> dict[str, Any]:
     return video
 
 
+CHAT_CONTEXT_CHARS = 60000
+CHAT_HISTORY_LIMIT = 20
+
+
+@app.get("/api/videos/{video_id}/chat")
+def list_chat_messages(video_id: int) -> dict[str, Any]:
+    with get_connection() as db:
+        if not db.execute("SELECT 1 FROM videos WHERE id = %s", (video_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="Video non trovato")
+        rows = db.execute(
+            "SELECT role, content, created_at FROM video_messages WHERE video_id = %s ORDER BY id",
+            (video_id,),
+        ).fetchall()
+    return {"messages": [row_to_dict(row) for row in rows]}
+
+
+@app.post("/api/videos/{video_id}/chat")
+def post_chat_message(video_id: int, message: str = Form(...)) -> dict[str, Any]:
+    message = message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Messaggio vuoto")
+    if not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY non configurata")
+    with get_connection() as db:
+        video = db.execute(
+            """
+            SELECT title, summary_long, summary, transcript, translation_json
+            FROM videos WHERE id = %s
+            """,
+            (video_id,),
+        ).fetchone()
+        if not video:
+            raise HTTPException(status_code=404, detail="Video non trovato")
+        history = db.execute(
+            "SELECT role, content FROM video_messages WHERE video_id = %s ORDER BY id",
+            (video_id,),
+        ).fetchall()
+        answer = chat_with_video(
+            row_to_dict(video), [row_to_dict(h) for h in history], message
+        )
+        db.execute(
+            "INSERT INTO video_messages (video_id, role, content) VALUES (%s, 'user', %s)",
+            (video_id, message),
+        )
+        db.execute(
+            "INSERT INTO video_messages (video_id, role, content) VALUES (%s, 'assistant', %s)",
+            (video_id, answer),
+        )
+        db.commit()
+    return {"reply": {"role": "assistant", "content": answer}}
+
+
+def chat_with_video(
+    video: dict[str, Any], history: list[dict[str, Any]], message: str
+) -> str:
+    client = OpenAI()
+    transcript = (video.get("transcript") or "")[:CHAT_CONTEXT_CHARS]
+    summary_long = video.get("summary_long") or video.get("summary") or ""
+    translation = ""
+    if video.get("translation_json"):
+        try:
+            segments = json.loads(video["translation_json"])
+            translation = "\n".join(str(s.get("text") or "") for s in segments)[:CHAT_CONTEXT_CHARS]
+        except (TypeError, ValueError):
+            translation = ""
+    system = (
+        "Sei un assistente che risponde a domande su un singolo video, basandoti SOLO "
+        "sul suo contenuto (trascrizione e riassunto). Rispondi sempre in italiano, in modo "
+        "conciso e accurato. Se l'informazione non è presente nel video, dillo chiaramente.\n\n"
+        f"Titolo: {video.get('title', '')}\n\n"
+        f"Riassunto:\n{summary_long}\n\n"
+        f"Trascrizione:\n{transcript}\n"
+    )
+    if translation:
+        system += f"\nTraduzione italiana della trascrizione:\n{translation}\n"
+    messages: list[dict[str, str]] = [{"role": "system", "content": system}]
+    for item in history[-CHAT_HISTORY_LIMIT:]:
+        if item.get("role") in ("user", "assistant"):
+            messages.append({"role": item["role"], "content": item.get("content") or ""})
+    messages.append({"role": "user", "content": message})
+    try:
+        response = client.chat.completions.create(
+            model=SUMMARY_MODEL, messages=messages, temperature=0.3
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Chat LLM fallita: {str(exc)}") from exc
+    return response.choices[0].message.content or ""
+
+
 def estimate_costs(
-    duration_seconds: Any, transcription_backend: str = "openai"
+    duration_seconds: Any,
+    transcription_backend: str = "openai",
+    source_language: str | None = None,
 ) -> dict[str, float | None]:
     # Estimate the per-stage USD cost from the source duration, known from metadata
     # before any download/transcription. Returns None values when duration is
@@ -150,7 +242,13 @@ def estimate_costs(
     except (TypeError, ValueError):
         seconds = 0.0
     if seconds <= 0:
-        return {"transcription_usd": None, "summary_usd": None, "embedding_usd": None, "total_usd": None}
+        return {
+            "transcription_usd": None,
+            "summary_usd": None,
+            "translation_usd": None,
+            "embedding_usd": None,
+            "total_usd": None,
+        }
 
     minutes = seconds / 60.0
     transcript_tokens = minutes * TRANSCRIPT_TOKENS_PER_MINUTE
@@ -168,13 +266,23 @@ def estimate_costs(
         input_tokens * SUMMARY_USD_PER_1M_INPUT + output_tokens * SUMMARY_USD_PER_1M_OUTPUT
     ) / 1_000_000
 
+    # Translation (non-Italian sources): the whole transcript goes in and a similar
+    # volume of Italian text comes out.
+    translation = 0.0
+    if source_language is not None and not is_italian(source_language):
+        translation = (
+            transcript_tokens * SUMMARY_USD_PER_1M_INPUT
+            + transcript_tokens * SUMMARY_USD_PER_1M_OUTPUT
+        ) / 1_000_000
+
     embedding = min(transcript_tokens + 400, 6000) * EMBEDDING_USD_PER_1M / 1_000_000
 
     return {
         "transcription_usd": round(transcription, 4),
         "summary_usd": round(summary, 4),
+        "translation_usd": round(translation, 4),
         "embedding_usd": round(embedding, 6),
-        "total_usd": round(transcription + summary + embedding, 4),
+        "total_usd": round(transcription + summary + translation + embedding, 4),
     }
 
 
@@ -182,6 +290,7 @@ def estimate_costs(
 def estimate_video(
     url: str = Form(...),
     transcription_backend: str = Form("openai"),
+    language_hint: str = Form("auto"),
 ) -> dict[str, Any]:
     url = url.strip()
     if not url.startswith(("http://", "https://")):
@@ -189,6 +298,9 @@ def estimate_video(
     metadata = download_metadata(url)
     duration = metadata.get("duration")
     transcription_model = WHISPER_MODEL if transcription_backend == "local" else "whisper-1"
+    # Only an explicit non-Italian hint lets us pre-estimate translation; "auto"
+    # language is unknown until after transcription.
+    estimate_language = None if language_hint == "auto" else language_hint
     return {
         "title": metadata.get("title"),
         "duration": duration,
@@ -198,7 +310,7 @@ def estimate_video(
             "summary": SUMMARY_MODEL,
             "embedding": EMBEDDING_MODEL,
         },
-        "costs": estimate_costs(duration, transcription_backend),
+        "costs": estimate_costs(duration, transcription_backend, estimate_language),
     }
 
 
@@ -221,16 +333,25 @@ def process_video(
         metadata = download_metadata(url)
         audio_path = download_audio(url, tmpdir)
         prepared_audio_path = prepare_export_audio(audio_path, tmpdir)
-        transcript_segments = transcribe_audio_file(
+        transcript_segments, detected_language = transcribe_audio_file(
             prepared_audio_path, tmpdir, language_hint, transcription_backend
         )
         transcript_text = segments_to_text(transcript_segments)
+
+        # Resolve the source language (explicit hint wins over detection) and, when
+        # it is not Italian, produce a per-segment Italian translation.
+        source_language = language_hint if language_hint != "auto" else detected_language
+        translation_segments = None
+        if not is_italian(source_language):
+            translation_segments = translate_segments(transcript_segments, source_language)
 
         summary_data = summarize(transcript_segments, metadata, language_hint)
         summary = combined_summary_text(summary_data)
         category = categorize_video(transcript_text, summary, metadata)
         embedding = embed_text(build_embedding_text(metadata, summary, transcript_text))
-        estimated_cost = estimate_costs(metadata.get("duration"), transcription_backend)["total_usd"]
+        estimated_cost = estimate_costs(
+            metadata.get("duration"), transcription_backend, source_language
+        )["total_usd"]
         saved_audio_path = persist_audio(prepared_audio_path, metadata)
         saved = save_video(
             url,
@@ -239,10 +360,11 @@ def process_video(
             transcript_text,
             transcript_segments,
             summary_data,
-            language_hint,
+            normalize_language(source_language),
             saved_audio_path,
             embedding,
             estimated_cost,
+            translation_segments,
         )
 
     return {"video": saved}
@@ -315,7 +437,7 @@ def download_video_audio(video_id: int) -> FileResponse:
 
 @app.get("/api/videos/{video_id}/export/{kind}.{fmt}")
 def export_video(video_id: int, kind: str, fmt: str) -> Response:
-    if kind not in {"summary", "transcript"}:
+    if kind not in {"summary", "transcript", "translation"}:
         raise HTTPException(status_code=400, detail="Tipo export non valido")
     if fmt not in {"txt", "pdf", "json"}:
         raise HTTPException(status_code=400, detail="Formato export non valido")
@@ -423,15 +545,21 @@ def prepare_export_audio(audio_path: Path, tmpdir: Path) -> Path:
 
 def transcribe_audio_file(
     audio_path: Path, tmpdir: Path, language_hint: str, backend: str = "openai"
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], str | None]:
+    # Returns (segments, detected_language); the language lets the caller decide
+    # whether a translation is needed when language_hint is "auto".
     if backend == "local":
         # faster-whisper handles arbitrarily long files, so no chunking/size limit.
         return transcribe_audio_local(audio_path, language_hint)
     chunks = prepare_audio_chunks(audio_path, tmpdir)
     transcript_segments: list[dict[str, Any]] = []
+    detected_language: str | None = None
     for chunk_path, offset in chunks:
-        transcript_segments.extend(transcribe_audio(chunk_path, language_hint, offset))
-    return transcript_segments
+        segments, language = transcribe_audio(chunk_path, language_hint, offset)
+        transcript_segments.extend(segments)
+        if detected_language is None:
+            detected_language = language
+    return transcript_segments, detected_language
 
 
 _local_whisper_model = None
@@ -456,15 +584,18 @@ def get_local_whisper_model():
     return _local_whisper_model
 
 
-def transcribe_audio_local(audio_path: Path, language_hint: str) -> list[dict[str, Any]]:
+def transcribe_audio_local(
+    audio_path: Path, language_hint: str
+) -> tuple[list[dict[str, Any]], str | None]:
     model = get_local_whisper_model()
     language = None if language_hint == "auto" else language_hint
     try:
-        segments, _info = model.transcribe(str(audio_path), language=language, vad_filter=True)
-        return [
+        segments, info = model.transcribe(str(audio_path), language=language, vad_filter=True)
+        result = [
             {"start": float(seg.start), "end": float(seg.end), "text": seg.text}
             for seg in segments
         ]
+        return result, getattr(info, "language", None)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Trascrizione locale fallita: {str(exc)}") from exc
 
@@ -539,7 +670,9 @@ def run_ffmpeg(args: list[str], message: str) -> None:
         raise HTTPException(status_code=500, detail=f"{message}: {exc.stderr.strip()}") from exc
 
 
-def transcribe_audio(audio_path: Path, language_hint: str, offset: float = 0.0) -> list[dict[str, Any]]:
+def transcribe_audio(
+    audio_path: Path, language_hint: str, offset: float = 0.0
+) -> tuple[list[dict[str, Any]], str | None]:
     client = OpenAI()
     language = None if language_hint == "auto" else language_hint
     try:
@@ -553,11 +686,12 @@ def transcribe_audio(audio_path: Path, language_hint: str, offset: float = 0.0) 
             )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Trascrizione OpenAI fallita: {str(exc)}") from exc
+    detected_language = getattr(transcript, "language", None)
     segments = getattr(transcript, "segments", None) or []
     if not segments:
         text = getattr(transcript, "text", "")
-        return [{"start": offset, "end": None, "text": text}]
-    return [
+        return [{"start": offset, "end": None, "text": text}], detected_language
+    result = [
         {
             "start": add_offset(segment.get("start") if isinstance(segment, dict) else segment.start, offset),
             "end": add_offset(segment.get("end") if isinstance(segment, dict) else segment.end, offset),
@@ -565,6 +699,7 @@ def transcribe_audio(audio_path: Path, language_hint: str, offset: float = 0.0) 
         }
         for segment in segments
     ]
+    return result, detected_language
 
 
 def add_offset(value: Any, offset: float) -> float | None:
@@ -573,13 +708,93 @@ def add_offset(value: Any, offset: float) -> float | None:
     return float(value) + offset
 
 
+_ITALIAN_NAMES = {"it", "ita", "italian", "italiano"}
+
+# Map Whisper's language names to short codes for storage.
+_LANGUAGE_CODES = {
+    "italian": "it", "italiano": "it", "ita": "it",
+    "russian": "ru", "russo": "ru", "rus": "ru",
+    "english": "en", "inglese": "en", "eng": "en",
+}
+
+
+def is_italian(language: str | None) -> bool:
+    return bool(language) and language.strip().lower() in _ITALIAN_NAMES
+
+
+def normalize_language(language: str | None) -> str | None:
+    if not language:
+        return None
+    value = language.strip().lower()
+    return _LANGUAGE_CODES.get(value, value[:8])
+
+
+# Translate the transcript in batches to keep each request within token limits.
+TRANSLATION_BATCH_CHARS = 12000
+
+
+def translate_segments(
+    transcript_segments: list[dict[str, Any]], source_language: str | None
+) -> list[dict[str, Any]]:
+    client = OpenAI()
+    translations: dict[int, str] = {}
+
+    def flush(batch: list[tuple[int, str]]) -> None:
+        if not batch:
+            return
+        items = [{"i": idx, "text": text} for idx, text in batch]
+        prompt = (
+            "Traduci in italiano il campo 'text' di ogni elemento del seguente array, "
+            "mantenendo lo stesso indice 'i'. Non unire né dividere gli elementi, non "
+            "aggiungere commenti. Restituisci solo JSON valido con chiave 'translations' "
+            "= array di oggetti {\"i\": intero, \"text\": traduzione italiana}.\n\n"
+            + json.dumps(items, ensure_ascii=False)
+        )
+        response = client.chat.completions.create(
+            model=SUMMARY_MODEL,
+            messages=[
+                {"role": "system", "content": "Sei un traduttore professionale verso l'italiano."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+            response_format={"type": "json_object"},
+        )
+        data = json.loads(response.choices[0].message.content or "{}")
+        for item in data.get("translations", []):
+            if isinstance(item, dict) and "i" in item:
+                try:
+                    translations[int(item["i"])] = str(item.get("text") or "").strip()
+                except (TypeError, ValueError):
+                    continue
+
+    batch: list[tuple[int, str]] = []
+    batch_chars = 0
+    for idx, segment in enumerate(transcript_segments):
+        text = str(segment.get("text") or "").strip()
+        batch.append((idx, text))
+        batch_chars += len(text)
+        if batch_chars >= TRANSLATION_BATCH_CHARS:
+            flush(batch)
+            batch, batch_chars = [], 0
+    flush(batch)
+
+    # Align 1:1 with the originals; fall back to the original text if a segment
+    # was dropped by the model.
+    return [
+        {
+            "start": segment.get("start"),
+            "end": segment.get("end"),
+            "text": translations.get(idx) or str(segment.get("text") or "").strip(),
+        }
+        for idx, segment in enumerate(transcript_segments)
+    ]
+
+
 def summarize(transcript_segments: list[dict[str, Any]], metadata: dict[str, Any], language_hint: str) -> dict[str, Any]:
     client = OpenAI()
-    language_instruction = {
-        "it": "Rispondi in italiano.",
-        "ru": "Rispondi in russo.",
-        "auto": "Rispondi nella lingua principale della trascrizione.",
-    }.get(language_hint, "Rispondi nella lingua principale della trascrizione.")
+    # Summaries are always in Italian regardless of the source language; the
+    # transcript stays in the original and a translation is produced separately.
+    language_instruction = "Rispondi sempre in italiano, anche se la trascrizione è in un'altra lingua."
     title = metadata.get("title") or "Video"
     timestamped_transcript = timestamped_segments_for_prompt(transcript_segments)
     prompt = f"""
@@ -754,13 +969,17 @@ def save_video(
     transcript_text: str,
     transcript_segments: list[dict[str, Any]],
     summary_data: dict[str, Any],
-    language_hint: str,
+    language: str | None,
     audio_path: Path,
     embedding: list[float] | None = None,
     estimated_cost_usd: float | None = None,
+    translation_segments: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     audio_filename = audio_path.name
     summary = combined_summary_text(summary_data)
+    translation_json = (
+        json.dumps(translation_segments, ensure_ascii=False) if translation_segments else None
+    )
     with get_connection() as db:
         new_id = db.execute(
             """
@@ -768,9 +987,9 @@ def save_video(
                 url, title, uploader, duration, thumbnail, webpage_url, language,
                 category, transcript, transcript_json, summary, summary_short, summary_long,
                 key_points_json, audio_path, audio_filename, audio_mime, embedding,
-                estimated_cost_usd
+                estimated_cost_usd, translation_json
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (
@@ -780,7 +999,7 @@ def save_video(
                 metadata.get("duration"),
                 metadata.get("thumbnail"),
                 metadata.get("webpage_url") or url,
-                None if language_hint == "auto" else language_hint,
+                language,
                 category,
                 transcript_text,
                 json.dumps(transcript_segments, ensure_ascii=False),
@@ -793,6 +1012,7 @@ def save_video(
                 "audio/mpeg",
                 embedding,
                 estimated_cost_usd,
+                translation_json,
             ),
         ).fetchone()["id"]
         db.commit()
@@ -800,6 +1020,7 @@ def save_video(
     saved = row_to_dict(row)
     saved.pop("transcript_json", None)
     saved.pop("embedding", None)
+    saved.pop("translation_json", None)
     return saved
 
 
@@ -870,8 +1091,16 @@ def segments_to_text(segments: list[dict[str, Any]]) -> str:
 
 
 def build_export_text(video: dict[str, Any], kind: str) -> str:
-    body = video["summary"] if kind == "summary" else video["transcript"]
-    label = "Riassunto" if kind == "summary" else "Trascrizione"
+    if kind == "summary":
+        body, label = video["summary"], "Riassunto"
+    elif kind == "translation":
+        segments = json.loads(video.get("translation_json") or "[]")
+        body = "\n".join(
+            f"[{format_timestamp(seg.get('start'))}] {seg.get('text', '')}" for seg in segments
+        )
+        label = "Traduzione (italiano)"
+    else:
+        body, label = video["transcript"], "Trascrizione"
     return f"{video['title']}\nCategoria: {video['category']}\nURL: {video['url']}\n\n{label}\n\n{body}\n"
 
 

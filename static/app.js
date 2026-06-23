@@ -139,6 +139,7 @@ function costTableHtml(costs, models) {
       <tbody>
         ${row("Trascrizione", models.transcription, costs.transcription_usd)}
         ${row("Riassunti e categoria", models.summary, costs.summary_usd)}
+        ${costs.translation_usd ? row("Traduzione in italiano", models.summary, costs.translation_usd) : ""}
         ${row("Embedding", models.embedding, costs.embedding_usd)}
       </tbody>
       <tfoot>${row("Totale stimato", "", costs.total_usd)}</tfoot>
@@ -149,10 +150,15 @@ function costTableHtml(costs, models) {
 function adjustedCosts(costs, transcriptionLocal) {
   if (!costs || costs.total_usd == null) return costs;
   const transcription = transcriptionLocal ? 0 : costs.transcription_usd;
-  const total = (transcription || 0) + (costs.summary_usd || 0) + (costs.embedding_usd || 0);
+  const total =
+    (transcription || 0) +
+    (costs.summary_usd || 0) +
+    (costs.translation_usd || 0) +
+    (costs.embedding_usd || 0);
   return {
     transcription_usd: transcription,
     summary_usd: costs.summary_usd,
+    translation_usd: costs.translation_usd,
     embedding_usd: costs.embedding_usd,
     total_usd: Math.round(total * 10000) / 10000,
   };
@@ -379,16 +385,28 @@ function renderDetail() {
       <a class="button-link" href="/api/videos/${video.id}/export/transcript.txt">Trascrizione TXT</a>
       <a class="button-link" href="/api/videos/${video.id}/export/transcript.pdf">Trascrizione PDF</a>
       <a class="button-link" href="/api/videos/${video.id}/export/transcript.json">JSON timestamp</a>
+      ${
+        Array.isArray(video.translation) && video.translation.length
+          ? `<a class="button-link" href="/api/videos/${video.id}/export/translation.txt">Traduzione TXT</a>
+             <a class="button-link" href="/api/videos/${video.id}/export/translation.pdf">Traduzione PDF</a>`
+          : ""
+      }
       <a class="button-link" href="/api/videos/${video.id}/audio">Audio MP3</a>
     </div>
     <audio class="audio-player" controls preload="metadata" src="/api/videos/${video.id}/audio"></audio>
-    <div class="tabs">
-      <button class="tab ${state.activeTab === "short" ? "active" : ""}" data-tab="short">Breve</button>
-      <button class="tab ${state.activeTab === "long" ? "active" : ""}" data-tab="long">Lungo</button>
-      <button class="tab ${state.activeTab === "points" ? "active" : ""}" data-tab="points">Punti</button>
-      <button class="tab ${state.activeTab === "transcript" ? "active" : ""}" data-tab="transcript">Trascrizione</button>
-    </div>
-    <div class="text-block ${state.activeTab !== "transcript" ? "markdown" : ""}">${body}</div>
+    <div class="tabs">${renderTabButtons(video)}</div>
+    ${
+      state.activeTab === "chat"
+        ? `<div class="chat">
+             <div class="chat-messages" data-chat-messages></div>
+             <form class="chat-form" data-chat-form>
+               <input class="chat-input" data-chat-input type="text" autocomplete="off"
+                 placeholder="Fai una domanda su questo video…" />
+               <button type="submit">Invia</button>
+             </form>
+           </div>`
+        : `<div class="text-block ${state.activeTab !== "transcript" ? "markdown" : ""}">${body}</div>`
+    }
   `;
   els.detailPanel.querySelector("[data-close]").addEventListener("click", () => els.detail.close());
   els.detailPanel.querySelectorAll("[data-seek]").forEach((button) => {
@@ -400,13 +418,113 @@ function renderDetail() {
       renderDetail();
     });
   });
+  if (state.activeTab === "chat") setupChat(video);
+}
+
+function renderTabButtons(video) {
+  const hasTranslation = Array.isArray(video.translation) && video.translation.length > 0;
+  const tabs = [
+    ["short", "Breve"],
+    ["long", "Lungo"],
+    ["points", "Punti"],
+    ["transcript", "Trascrizione"],
+    ...(hasTranslation ? [["translation", "Traduzione"]] : []),
+    ["chat", "Chat"],
+  ];
+  return tabs
+    .map(
+      ([id, label]) =>
+        `<button class="tab ${state.activeTab === id ? "active" : ""}" data-tab="${id}">${label}</button>`
+    )
+    .join("");
 }
 
 function renderActiveTab(video) {
   if (state.activeTab === "short") return renderMarkdown(video.summary_short || video.summary || "");
   if (state.activeTab === "long") return renderMarkdown(video.summary_long || video.summary || "");
   if (state.activeTab === "points") return renderKeyPoints(video.key_points || []);
+  if (state.activeTab === "translation") return renderTranslation(video);
+  if (state.activeTab === "chat") return "";
   return escapeHtml(video.transcript || "");
+}
+
+function renderTranslation(video) {
+  const original = video.transcript_json || [];
+  const translated = video.translation || [];
+  if (!translated.length) return "<p>Nessuna traduzione disponibile per questo video.</p>";
+  const rows = translated
+    .map((seg, i) => {
+      const seconds = Number(seg.start || 0);
+      const orig = (original[i] && original[i].text) || "";
+      return `
+        <tr>
+          <td><button class="time-button" type="button" data-seek="${seconds}">${formatTimestamp(seconds)}</button></td>
+          <td>${escapeHtml(orig)}</td>
+          <td>${escapeHtml(seg.text || "")}</td>
+        </tr>`;
+    })
+    .join("");
+  return `
+    <table class="points-table">
+      <thead>
+        <tr><th>Minuto</th><th>Originale</th><th>Italiano</th></tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+async function setupChat(video) {
+  const messagesEl = els.detailPanel.querySelector("[data-chat-messages]");
+  const form = els.detailPanel.querySelector("[data-chat-form]");
+  const input = els.detailPanel.querySelector("[data-chat-input]");
+  if (!messagesEl || !form || !input) return;
+
+  const appendMessage = (role, content) => {
+    const bubble = document.createElement("div");
+    bubble.className = `chat-bubble ${role}`;
+    bubble.textContent = content;
+    messagesEl.append(bubble);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    return bubble;
+  };
+
+  messagesEl.innerHTML = '<div class="chat-empty">Caricamento…</div>';
+  try {
+    const data = await readJson(await fetch(`/api/videos/${video.id}/chat`));
+    messagesEl.innerHTML = "";
+    if (!data.messages.length) {
+      messagesEl.innerHTML = '<div class="chat-empty">Nessun messaggio. Fai una domanda sul video.</div>';
+    } else {
+      data.messages.forEach((m) => appendMessage(m.role, m.content));
+    }
+  } catch (error) {
+    messagesEl.innerHTML = `<div class="chat-empty">${escapeHtml(error.message)}</div>`;
+  }
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const text = input.value.trim();
+    if (!text) return;
+    const empty = messagesEl.querySelector(".chat-empty");
+    if (empty) empty.remove();
+    appendMessage("user", text);
+    input.value = "";
+    input.disabled = true;
+    const pending = appendMessage("assistant", "…");
+    try {
+      const body = new FormData();
+      body.set("message", text);
+      const data = await readJson(await fetch(`/api/videos/${video.id}/chat`, { method: "POST", body }));
+      pending.textContent = data.reply.content;
+    } catch (error) {
+      pending.textContent = `Errore: ${error.message}`;
+      pending.classList.add("error");
+    } finally {
+      input.disabled = false;
+      input.focus();
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+  });
 }
 
 function renderKeyPoints(points) {

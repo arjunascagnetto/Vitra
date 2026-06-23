@@ -108,8 +108,13 @@ The whole backend is two files plus a static frontend.
      (`transcribe_audio_local`, model cached in `get_local_whisper_model`) on this
      machine — free, no size limit, no chunking. Both return the same
      `{start, end, text}` segments.
+  3b. `translate_segments` — when the source language isn't Italian (explicit
+     `ru` hint or Whisper-detected), translate the transcript **per segment** to
+     Italian (batched `gpt-5.4` JSON calls, 1:1 index mapping with fallback to the
+     original), stored in `translation_json`. Italian sources get no translation.
   4. `summarize` — one OpenAI JSON-mode call returns `summary_short`,
      `summary_long`, and `key_points` (each with `time_seconds`/`title`/`detail`).
+     Summaries are **always in Italian** regardless of source language;
      `normalize_summary_data` defends against malformed model output.
   5. `categorize_video` — separate OpenAI call for a short Italian category, with
      `fallback_category` from source metadata if the call fails.
@@ -126,6 +131,10 @@ The whole backend is two files plus a static frontend.
   Postgres FTS over `search_vector`) and `semantic` (pgvector cosine distance,
   `embedding <=> %s::vector`, ordering by nearest query embedding).
   `DELETE /api/videos/{id}` removes the row and best-effort unlinks its MP3.
+  `GET`/`POST /api/videos/{id}/chat` is a persisted, transcript-grounded chat
+  (`chat_with_video`, cloud `gpt-5.4`, answers in Italian); messages live in the
+  `video_messages` table (cascade-deleted with the video). `language_hint` is now
+  the **source/transcription language only**; export adds a `translation` kind.
   `POST /api/videos/estimate` returns a per-stage USD cost breakdown
   (transcription/summary/embedding + total) from `estimate_costs`, computed from
   the source duration *before* processing; with `transcription_backend=local` the
@@ -139,7 +148,9 @@ The whole backend is two files plus a static frontend.
   `psycopg` 3 with `dict_row`; `register_vector` enables pgvector on each
   connection. Single `videos` table with: a `search_vector` **generated** tsvector
   column (`TS_CONFIG`, GIN index) replacing the old SQLite FTS5 table + triggers;
-  and an `embedding vector(EMBEDDING_DIM)` column with an IVFFlat cosine index.
+  and an `embedding vector(EMBEDDING_DIM)` column with an IVFFlat cosine index;
+  `translation_json` holds the per-segment Italian translation. A separate
+  `video_messages` table (FK to `videos`, `ON DELETE CASCADE`) stores per-video chat.
   Schema migrations are idempotent via `ensure_column` (`ADD COLUMN IF NOT EXISTS`).
   Query placeholders are `%s` (not `?`).
 
@@ -151,7 +162,10 @@ The whole backend is two files plus a static frontend.
   `openConfirm()` is a themed, promise-based `<dialog>` (replaces native
   `window.confirm`) used for the cost-estimate gate before processing and for the
   delete confirmation (danger variant) — keep both flows on it, not on
-  `window.confirm`. Mounted at `/static`.
+  `window.confirm`. The detail modal also has a **Traduzione** tab (shown only when
+  `video.translation` exists; original ↔ Italian per segment) and a **Chat** tab
+  (`setupChat`, interactive — does its own DOM updates, not a full `renderDetail`).
+  Mounted at `/static`.
 
 ### Key design rules
 
