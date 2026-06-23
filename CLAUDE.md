@@ -77,6 +77,10 @@ bundled imageio-ffmpeg binary, so audio download/import works on Windows.
   rows (the `embedding vector(N)` column dimension must match).
 - `DATABASE_URL` — defaults to `postgresql://postgres@localhost:5432/transcript`.
 - `TS_CONFIG` — Postgres text-search config for the FTS column; defaults to `italian`.
+- Cost-estimate prices (USD, real OpenAI rates, override if they change):
+  `WHISPER_USD_PER_MINUTE` (0.006), `SUMMARY_USD_PER_1M_INPUT` (2.50),
+  `SUMMARY_USD_PER_1M_OUTPUT` (15.0), `EMBEDDING_USD_PER_1M` (0.02). Token-billed
+  calls are sized from duration via `TRANSCRIPT_TOKENS_PER_MINUTE`/`SUMMARY_OUTPUT_TOKENS`.
 
 ## Architecture
 
@@ -112,6 +116,11 @@ The whole backend is two files plus a static frontend.
   Postgres FTS over `search_vector`) and `semantic` (pgvector cosine distance,
   `embedding <=> %s::vector`, ordering by nearest query embedding).
   `DELETE /api/videos/{id}` removes the row and best-effort unlinks its MP3.
+  `POST /api/videos/estimate` returns a per-stage USD cost breakdown
+  (transcription/summary/embedding + total) from `estimate_costs`, computed from
+  the source duration *before* processing; the total is stored in
+  `estimated_cost_usd` on `save_video`. The frontend shows this estimate in a
+  confirmation dialog and requires confirmation before calling `POST /api/videos`.
 
 - `app/database.py` — PostgreSQL (`DATABASE_URL`, default DB `transcript`) via
   `psycopg` 3 with `dict_row`; `register_vector` enables pgvector on each
@@ -125,8 +134,11 @@ The whole backend is two files plus a static frontend.
   detail modal embeds an audio player and key points seek the player by
   `time_seconds`. Posters carry a trash button (`deleteVideo`); during import an
   indeterminate progress bar advances timed stage messages (`PROCESSING_STAGES`)
-  since the backend processes synchronously and reports no real progress. Mounted
-  at `/static`.
+  since the backend processes synchronously and reports no real progress.
+  `openConfirm()` is a themed, promise-based `<dialog>` (replaces native
+  `window.confirm`) used for the cost-estimate gate before processing and for the
+  delete confirmation (danger variant) — keep both flows on it, not on
+  `window.confirm`. Mounted at `/static`.
 
 ### Key design rules
 

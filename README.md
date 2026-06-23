@@ -71,6 +71,11 @@ OPENAI_EMBEDDING_MODEL=text-embedding-3-small
 DATABASE_URL=postgresql://postgres@localhost:5432/transcript
 ```
 
+I prezzi usati per la stima di costo (Whisper, modello riassunti, embedding) sono
+configurabili in `.env` (`WHISPER_USD_PER_MINUTE`, `SUMMARY_USD_PER_1M_INPUT`,
+`SUMMARY_USD_PER_1M_OUTPUT`, `EMBEDDING_USD_PER_1M`) — i default sono i prezzi
+OpenAI reali e vanno aggiornati se cambiano.
+
 Installa le dipendenze e configura DB + schema (oppure lascia che `init_db()` crei
 lo schema al primo avvio):
 
@@ -88,6 +93,9 @@ Avvia con `uvicorn app.main:app --reload --host 127.0.0.1 --port 8000` e apri
 - Categorie automatiche per separare i video.
 - Ricerca full-text su titolo, autore, URL, categoria, trascrizione e riassunto.
 - Ricerca vettoriale sugli embedding (pgvector, distanza coseno) per la ricerca semantica (`?mode=semantic`).
+- Stima di costo prima dell'elaborazione, con dettaglio per voce (trascrizione
+  Whisper, riassunti gpt-5.4, embedding) e totale, e conferma richiesta prima di
+  avviare il processing.
 - Barra di stato durante l'elaborazione del video.
 - Vista per locandine raggruppate per categoria, con eliminazione singola (cestino).
 - Scheda video con player audio.
