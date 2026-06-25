@@ -183,7 +183,7 @@ button.secondary {
 
 .toolbar {
   display: grid;
-  grid-template-columns: 1fr 220px auto;
+  grid-template-columns: 1fr 200px auto auto;
   gap: 12px;
   margin: 16px 0;
 }
@@ -639,6 +639,64 @@ button.secondary {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
+}
+
+.chat-dialog {
+  width: min(840px, calc(100vw - 28px));
+  max-height: calc(100vh - 36px);
+  border: 0;
+  padding: 0;
+  background: transparent;
+}
+
+.chat-dialog::backdrop {
+  background: rgba(3, 6, 7, 0.72);
+}
+
+.general-chat-panel {
+  padding: 18px;
+}
+
+.general-chat-panel .detail-head {
+  margin-bottom: 12px;
+}
+
+.general-chat-panel .chat-messages {
+  max-height: 56vh;
+  min-height: 220px;
+}
+
+.gchat-categories {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.gchat-cat-label {
+  color: var(--muted);
+  font-size: 13px;
+  margin-right: 4px;
+}
+
+.cat-toggle {
+  height: 30px;
+  padding: 0 10px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  background: var(--surface-2);
+  border-color: var(--line);
+}
+
+.cat-toggle:hover {
+  background: var(--surface-3);
+}
+
+.cat-toggle.active {
+  color: #061716;
+  background: var(--accent);
+  border-color: var(--accent);
 }
 
 .category-pill-wrap {

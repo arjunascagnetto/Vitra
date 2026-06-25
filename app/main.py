@@ -233,6 +233,26 @@ WEB_SEARCH_TOOL = {
 }
 
 
+GET_TRANSCRIPT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_transcript",
+        "description": (
+            "Restituisce la trascrizione completa di un video dato il suo id (presente nel "
+            "catalogo). Usalo quando i riassunti non bastano."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"video_id": {"type": "integer", "description": "L'id del video."}},
+            "required": ["video_id"],
+        },
+    },
+}
+GENERAL_CHAT_MAX_ITERATIONS = 6
+GENERAL_TRANSCRIPT_CHARS = 40000
+GENERAL_SUMMARY_LONG_CHARS = 1500
+
+
 def tavily_search(query: str) -> list[dict[str, Any]]:
     if not TAVILY_API_KEY:
         return [{"error": "Ricerca web non configurata"}]
@@ -452,6 +472,144 @@ def chat_with_video(
         return final.choices[0].message.content or ""
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Chat LLM fallita: {str(exc)}") from exc
+
+
+@app.get("/api/chat")
+def list_general_messages() -> dict[str, Any]:
+    with get_connection() as db:
+        rows = db.execute(
+            "SELECT role, content, created_at FROM general_messages ORDER BY id"
+        ).fetchall()
+    return {"messages": [row_to_dict(r) for r in rows]}
+
+
+@app.post("/api/chat")
+def post_general_message(
+    message: str = Form(...),
+    categories: list[str] = Form(default=[]),
+) -> dict[str, Any]:
+    message = message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Messaggio vuoto")
+    if not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY non configurata")
+    selected = [c.strip() for c in categories if c.strip()]
+    with get_connection() as db:
+        history = db.execute(
+            "SELECT role, content FROM general_messages ORDER BY id"
+        ).fetchall()
+        answer = general_chat([row_to_dict(h) for h in history], message, selected)
+        db.execute("INSERT INTO general_messages (role, content) VALUES ('user', %s)", (message,))
+        db.execute(
+            "INSERT INTO general_messages (role, content) VALUES ('assistant', %s)", (answer,)
+        )
+        db.commit()
+    return {"reply": {"role": "assistant", "content": answer}}
+
+
+@app.delete("/api/chat")
+def reset_general_chat() -> dict[str, Any]:
+    with get_connection() as db:
+        db.execute("DELETE FROM general_messages")
+        db.commit()
+    return {"messages": []}
+
+
+def general_chat(history: list[dict[str, Any]], message: str, categories: list[str]) -> str:
+    client = OpenAI()
+    with get_connection() as db:
+        if categories:
+            rows = db.execute(
+                """
+                SELECT id, title, category, summary_short, summary_long, transcript
+                FROM videos WHERE category = ANY(%s) ORDER BY id
+                """,
+                (categories,),
+            ).fetchall()
+        else:
+            rows = db.execute(
+                "SELECT id, title, category, summary_short, summary_long, transcript FROM videos ORDER BY id"
+            ).fetchall()
+    videos = [row_to_dict(r) for r in rows]
+    transcripts = {v["id"]: v.get("transcript") or "" for v in videos}
+
+    catalog = "\n\n".join(
+        f"[id={v['id']}] Categoria: {v.get('category') or 'Senza categoria'} | Titolo: {v.get('title')}\n"
+        f"Riassunto breve: {(v.get('summary_short') or '').strip()}\n"
+        f"Riassunto lungo: {(v.get('summary_long') or '')[:GENERAL_SUMMARY_LONG_CHARS].strip()}"
+        for v in videos
+    ) or "(nessun video nello scope selezionato)"
+
+    web_enabled = bool(TAVILY_API_KEY)
+    scope = (
+        f"categorie selezionate: {', '.join(categories)}" if categories else "tutti i video"
+    )
+    system = (
+        "Sei un assistente che risponde basandoti su un archivio di video (riassunti e "
+        "trascrizioni). Rispondi sempre in italiano e cita i video pertinenti per titolo. "
+        "Hai il catalogo qui sotto con id, categoria e riassunti breve/lungo. Per leggere la "
+        "trascrizione completa di un video usa lo strumento get_transcript con il suo id.\n"
+    )
+    if web_enabled:
+        system += (
+            "Per informazioni non presenti nell'archivio puoi usare web_search; cita le fonti (URL).\n"
+        )
+    system += f"\nScope: {scope}.\n\nCatalogo video:\n{catalog}\n"
+
+    messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
+    for item in history:
+        if item.get("role") in ("user", "assistant"):
+            messages.append({"role": item["role"], "content": item.get("content") or ""})
+    messages.append({"role": "user", "content": message})
+
+    tools = [GET_TRANSCRIPT_TOOL] + ([WEB_SEARCH_TOOL] if web_enabled else [])
+    allowed_ids = set(transcripts)
+    try:
+        for _ in range(GENERAL_CHAT_MAX_ITERATIONS):
+            reply = client.chat.completions.create(
+                model=SUMMARY_MODEL, messages=messages, temperature=0.3, tools=tools, tool_choice="auto"
+            ).choices[0].message
+            if not reply.tool_calls:
+                return reply.content or ""
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": reply.content or "",
+                    "tool_calls": [
+                        {
+                            "id": call.id,
+                            "type": "function",
+                            "function": {"name": call.function.name, "arguments": call.function.arguments},
+                        }
+                        for call in reply.tool_calls
+                    ],
+                }
+            )
+            for call in reply.tool_calls:
+                args = json.loads(call.function.arguments or "{}")
+                if call.function.name == "get_transcript":
+                    vid = int(args.get("video_id", 0) or 0)
+                    if vid in allowed_ids:
+                        result: Any = {"video_id": vid, "transcript": transcripts[vid][:GENERAL_TRANSCRIPT_CHARS]}
+                    else:
+                        result = {"error": "Video non disponibile nello scope selezionato"}
+                elif call.function.name == "web_search":
+                    result = tavily_search(str(args.get("query", "")))
+                else:
+                    result = {"error": "Strumento non disponibile"}
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": json.dumps(result, ensure_ascii=False),
+                    }
+                )
+        final = client.chat.completions.create(
+            model=SUMMARY_MODEL, messages=messages, temperature=0.3
+        )
+        return final.choices[0].message.content or ""
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Chat generale fallita: {str(exc)}") from exc
 
 
 def estimate_costs(

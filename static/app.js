@@ -18,6 +18,8 @@ const els = {
   settings: document.querySelector("#settings"),
   categoriesDialog: document.querySelector("#categories"),
   manageCategories: document.querySelector("#manage-categories"),
+  generalChat: document.querySelector("#general-chat"),
+  openGeneralChat: document.querySelector("#open-general-chat"),
   search: document.querySelector("#search"),
   categoryFilter: document.querySelector("#category-filter"),
 };
@@ -256,7 +258,111 @@ function formatCost(value) {
 els.search.addEventListener("input", debounce(loadVideos, 250));
 els.categoryFilter.addEventListener("change", loadVideos);
 els.manageCategories.addEventListener("click", openCategoriesManager);
+els.openGeneralChat.addEventListener("click", openGeneralChat);
 wireDialogClose(els.categoriesDialog);
+wireDialogClose(els.generalChat);
+
+// Categories selected as scope for the general chat (empty = all videos).
+const gchatScope = new Set();
+
+async function openGeneralChat() {
+  const dlg = els.generalChat;
+  const messagesEl = dlg.querySelector("[data-gchat-messages]");
+  const form = dlg.querySelector("[data-gchat-form]");
+  const input = dlg.querySelector("[data-gchat-input]");
+  const catsEl = dlg.querySelector("[data-gchat-categories]");
+  const resetBtn = dlg.querySelector("[data-gchat-reset]");
+
+  const appendMessage = (role, content) => {
+    const bubble = document.createElement("div");
+    bubble.className = `chat-bubble ${role}`;
+    bubble.textContent = content;
+    messagesEl.append(bubble);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    return bubble;
+  };
+  const renderMessages = (messages) => {
+    messagesEl.innerHTML = messages.length
+      ? ""
+      : '<div class="chat-empty">Chiedi qualcosa sui video dell\'archivio.</div>';
+    messages.forEach((m) => appendMessage(m.role, m.content));
+  };
+
+  // Category scope toggles (multi-select; none = all).
+  try {
+    const cats = (await readJson(await fetch("/api/categories"))).categories;
+    catsEl.innerHTML =
+      '<span class="gchat-cat-label">Parla con:</span>' +
+      (cats
+        .map(
+          (c) =>
+            `<button type="button" class="cat-toggle${
+              gchatScope.has(c.name) ? " active" : ""
+            }" data-cat="${escapeHtml(c.name)}">${escapeHtml(c.name)}</button>`
+        )
+        .join("") || '<span class="gchat-cat-label">nessuna categoria</span>');
+    catsEl.querySelectorAll(".cat-toggle").forEach((button) => {
+      button.addEventListener("click", () => {
+        const name = button.dataset.cat;
+        if (gchatScope.has(name)) gchatScope.delete(name);
+        else gchatScope.add(name);
+        button.classList.toggle("active");
+      });
+    });
+  } catch (error) {
+    catsEl.innerHTML = `<span class="gchat-cat-label">${escapeHtml(error.message)}</span>`;
+  }
+
+  messagesEl.innerHTML = '<div class="chat-empty">Caricamento…</div>';
+  try {
+    renderMessages((await readJson(await fetch("/api/chat"))).messages);
+  } catch (error) {
+    messagesEl.innerHTML = `<div class="chat-empty">${escapeHtml(error.message)}</div>`;
+  }
+
+  form.onsubmit = async (event) => {
+    event.preventDefault();
+    const text = input.value.trim();
+    if (!text) return;
+    const empty = messagesEl.querySelector(".chat-empty");
+    if (empty) empty.remove();
+    appendMessage("user", text);
+    input.value = "";
+    input.disabled = true;
+    const pending = appendMessage("assistant", "…");
+    try {
+      const body = new FormData();
+      body.set("message", text);
+      gchatScope.forEach((name) => body.append("categories", name));
+      const data = await readJson(await fetch("/api/chat", { method: "POST", body }));
+      pending.textContent = data.reply.content;
+    } catch (error) {
+      pending.textContent = `Errore: ${error.message}`;
+      pending.classList.add("error");
+    } finally {
+      input.disabled = false;
+      input.focus();
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+  };
+
+  resetBtn.onclick = async () => {
+    const ok = await openConfirm({
+      title: "Reset chat",
+      bodyHtml: "<p>Cancellare tutta la cronologia della chat sull'archivio?</p>",
+      confirmLabel: "Reset",
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      renderMessages((await readJson(await fetch("/api/chat", { method: "DELETE" }))).messages);
+    } catch (error) {
+      setStatus(error.message, true);
+    }
+  };
+
+  if (!dlg.open) dlg.showModal();
+}
 
 function wireDialogClose(dlg) {
   const close = () => {

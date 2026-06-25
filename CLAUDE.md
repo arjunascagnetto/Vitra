@@ -141,7 +141,13 @@ The whole backend is two files plus a static frontend.
   without the key the chat stays video-only. The chat sends the **full** history each
   turn; `DELETE /api/videos/{id}/chat` resets it and `POST .../chat/compact`
   (`summarize_conversation`) replaces it with a single recap message — surfaced as
-  "Compatta"/"Reset" buttons under the chat. `language_hint` is now
+  "Compatta"/"Reset" buttons under the chat.
+  A separate **corpus-wide chat** (`GET/POST/DELETE /api/chat`, `general_chat`,
+  persisted in `general_messages`) answers across all videos: the system prompt holds a
+  catalog (id/category/short+long summaries) of the in-scope videos, and the model reads
+  full transcripts on demand via a `get_transcript` tool (plus `web_search`). The
+  "Chat archivio" dialog has per-category multi-select toggles that scope which videos
+  are included (none selected = all); the selected category names are sent as `categories`. `language_hint` is now
   the **source/transcription language only**; export adds a `translation` kind.
   Categories are first-class: `GET/POST /api/categories`, `DELETE /api/categories/{name}`
   (videos fall back to the `UNCATEGORIZED` sentinel, not deleted), and

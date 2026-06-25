@@ -124,6 +124,17 @@ def init_db() -> None:
         db.execute(
             "CREATE INDEX IF NOT EXISTS video_messages_video_idx ON video_messages(video_id)"
         )
+        # Global (corpus-wide) chat history, independent of any single video.
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS general_messages (
+                id BIGSERIAL PRIMARY KEY,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
         # Canonical category registry (manageable independently of videos).
         db.execute(
             """

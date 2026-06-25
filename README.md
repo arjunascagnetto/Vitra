@@ -108,6 +108,8 @@ Avvia con `uvicorn app.main:app --reload --host 127.0.0.1 --port 8000` e apri
   (OpenAI `whisper-1`), selezionabile dal pannello impostazioni a ogni elaborazione.
 - **Chat per-video** alimentata da LLM (gpt-5.4), ancorata alla trascrizione/riassunto
   e con cronologia salvata nel DB.
+- **Chat sull'archivio** (tutti i video): legge riassunti e trascrizioni, può navigare
+  in rete (Tavily) e si può limitare a una o più categorie con i pulsanti multi-selezione.
 - Video **non in italiano** (es. russo da VK/`vkvideo.ru`): trascrizione nell'originale,
   **traduzione italiana per-segmento** (tab Traduzione), riassunti corti/lunghi in italiano.
 - Stima di costo prima dell'elaborazione, con dettaglio per voce (trascrizione,

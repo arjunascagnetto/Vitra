@@ -31,6 +31,7 @@
         <select id="category-filter">
           <option value="">Tutte le categorie</option>
         </select>
+        <button id="open-general-chat" type="button" class="secondary">Chat archivio</button>
         <button id="manage-categories" type="button" class="secondary">Categorie</button>
       </section>
 
@@ -70,6 +71,27 @@
           <div class="categories-body"></div>
           <div class="confirm-actions">
             <button type="button" class="confirm-cancel" data-cancel>Chiudi</button>
+          </div>
+        </article>
+      </dialog>
+
+      <dialog id="general-chat" class="chat-dialog">
+        <article class="panel general-chat-panel">
+          <div class="detail-head">
+            <h2>Chat sull'archivio</h2>
+            <button class="icon-button" type="button" data-cancel aria-label="Chiudi">×</button>
+          </div>
+          <div class="chat">
+            <div class="chat-messages" data-gchat-messages></div>
+            <form class="chat-form" data-gchat-form>
+              <input class="chat-input" data-gchat-input type="text" autocomplete="off"
+                placeholder="Chiedi qualcosa sull'archivio…" />
+              <button type="submit">Invia</button>
+            </form>
+            <div class="gchat-categories" data-gchat-categories></div>
+            <div class="chat-actions">
+              <button type="button" class="secondary" data-gchat-reset>Reset</button>
+            </div>
           </div>
         </article>
       </dialog>
