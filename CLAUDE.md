@@ -77,6 +77,8 @@ bundled imageio-ffmpeg binary, so audio download/import works on Windows.
   rows (the `embedding vector(N)` column dimension must match).
 - `DATABASE_URL` — defaults to `postgresql://postgres@localhost:5432/transcript`.
 - `TS_CONFIG` — Postgres text-search config for the FTS column; defaults to `italian`.
+- `TAVILY_API_KEY` — optional; enables the chat's `web_search` tool (`TAVILY_MAX_RESULTS`
+  caps results). Absent → chat is video-only.
 - Local transcription (faster-whisper): `WHISPER_MODEL` (`large-v3`), `WHISPER_DEVICE`
   (`auto`), `WHISPER_COMPUTE_TYPE` (`default`). GPU works via **torch (CUDA build,
   cu124)** — `get_local_whisper_model` imports `torch` first so CTranslate2 finds
@@ -133,8 +135,18 @@ The whole backend is two files plus a static frontend.
   `DELETE /api/videos/{id}` removes the row and best-effort unlinks its MP3.
   `GET`/`POST /api/videos/{id}/chat` is a persisted, transcript-grounded chat
   (`chat_with_video`, cloud `gpt-5.4`, answers in Italian); messages live in the
-  `video_messages` table (cascade-deleted with the video). `language_hint` is now
+  `video_messages` table (cascade-deleted with the video). When `TAVILY_API_KEY` is
+  set the chat gets a `web_search` tool (`tavily_search`) via a tool-calling loop
+  (max `CHAT_MAX_TOOL_ITERATIONS`), used only when the answer isn't in the video;
+  without the key the chat stays video-only. The chat sends the **full** history each
+  turn; `DELETE /api/videos/{id}/chat` resets it and `POST .../chat/compact`
+  (`summarize_conversation`) replaces it with a single recap message — surfaced as
+  "Compatta"/"Reset" buttons under the chat. `language_hint` is now
   the **source/transcription language only**; export adds a `translation` kind.
+  Categories are first-class: `GET/POST /api/categories`, `DELETE /api/categories/{name}`
+  (videos fall back to the `UNCATEGORIZED` sentinel, not deleted), and
+  `PUT /api/videos/{id}/category` (auto-registers a new name). `videos.category` stays
+  the denormalized per-video value; the `categories` table is the canonical registry.
   `POST /api/videos/estimate` returns a per-stage USD cost breakdown
   (transcription/summary/embedding + total) from `estimate_costs`, computed from
   the source duration *before* processing; with `transcription_backend=local` the
@@ -150,7 +162,9 @@ The whole backend is two files plus a static frontend.
   column (`TS_CONFIG`, GIN index) replacing the old SQLite FTS5 table + triggers;
   and an `embedding vector(EMBEDDING_DIM)` column with an IVFFlat cosine index;
   `translation_json` holds the per-segment Italian translation. A separate
-  `video_messages` table (FK to `videos`, `ON DELETE CASCADE`) stores per-video chat.
+  `video_messages` table (FK to `videos`, `ON DELETE CASCADE`) stores per-video chat,
+  and a `categories` table (seeded from existing video categories) is the canonical
+  category registry.
   Schema migrations are idempotent via `ensure_column` (`ADD COLUMN IF NOT EXISTS`).
   Query placeholders are `%s` (not `?`).
 
@@ -165,7 +179,9 @@ The whole backend is two files plus a static frontend.
   `window.confirm`. The detail modal also has a **Traduzione** tab (shown only when
   `video.translation` exists; original ↔ Italian per segment) and a **Chat** tab
   (`setupChat`, interactive — does its own DOM updates, not a full `renderDetail`).
-  Mounted at `/static`.
+  The detail category pill is a button opening a picker (assign existing or create-new
+  → `assignCategory`); a toolbar "Categorie" button opens a manager (create/delete →
+  `openCategoriesManager`). Mounted at `/static`.
 
 ### Key design rules
 

@@ -31,6 +31,7 @@
         <select id="category-filter">
           <option value="">Tutte le categorie</option>
         </select>
+        <button id="manage-categories" type="button" class="secondary">Categorie</button>
       </section>
 
       <section class="content">
@@ -59,6 +60,16 @@
           <div class="confirm-actions">
             <button type="button" class="confirm-cancel" data-cancel>Annulla</button>
             <button type="button" class="confirm-ok" data-ok>Processa</button>
+          </div>
+        </article>
+      </dialog>
+
+      <dialog id="categories" class="confirm-dialog">
+        <article class="panel confirm">
+          <h2 class="confirm-title">Categorie</h2>
+          <div class="categories-body"></div>
+          <div class="confirm-actions">
+            <button type="button" class="confirm-cancel" data-cancel>Chiudi</button>
           </div>
         </article>
       </dialog>

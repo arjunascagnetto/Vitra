@@ -99,7 +99,9 @@ Avvia con `uvicorn app.main:app --reload --host 127.0.0.1 --port 8000` e apri
 ## Funzioni
 
 - Import da YouTube o VK Video tramite URL pubblico.
-- Categorie automatiche per separare i video.
+- Categorie automatiche per separare i video, con **gestione manuale**: crea/elimina
+  categorie e riassegna un video dal suo pannello (eliminando una categoria i video
+  restano "Senza categoria").
 - Ricerca full-text su titolo, autore, URL, categoria, trascrizione e riassunto.
 - Ricerca vettoriale sugli embedding (pgvector, distanza coseno) per la ricerca semantica (`?mode=semantic`).
 - Trascrizione **locale** con faster-whisper (`large-v3`, GPU) oppure **cloud**

@@ -124,6 +124,26 @@ def init_db() -> None:
         db.execute(
             "CREATE INDEX IF NOT EXISTS video_messages_video_idx ON video_messages(video_id)"
         )
+        # Canonical category registry (manageable independently of videos).
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS categories (
+                id BIGSERIAL PRIMARY KEY,
+                name TEXT UNIQUE NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        # Seed from existing video categories (idempotent), excluding the
+        # "uncategorized" sentinel.
+        db.execute(
+            """
+            INSERT INTO categories (name)
+            SELECT DISTINCT category FROM videos
+            WHERE category IS NOT NULL AND category <> '' AND category <> 'Senza categoria'
+            ON CONFLICT (name) DO NOTHING
+            """
+        )
         db.commit()
 
 

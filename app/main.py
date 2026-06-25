@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import urllib.request
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -46,6 +47,8 @@ WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "auto")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "default")
 
 OPENAI_AUDIO_LIMIT_BYTES = 24 * 1024 * 1024
+# Sentinel for videos with no category; never stored in the `categories` table.
+UNCATEGORIZED = "Senza categoria"
 # Keep embedding input well under the model's 8191-token limit (~4 chars/token).
 EMBEDDING_INPUT_CHARS = 24000
 AUDIO_DIR = DATA_DIR / "audio"
@@ -120,6 +123,69 @@ def list_videos(
     }
 
 
+@app.get("/api/categories")
+def list_all_categories() -> dict[str, Any]:
+    # Canonical category list (table) with per-category video counts, including
+    # categories that currently have no videos.
+    with get_connection() as db:
+        rows = db.execute(
+            """
+            SELECT c.name, COUNT(v.id) AS count
+            FROM categories c
+            LEFT JOIN videos v ON v.category = c.name
+            GROUP BY c.name
+            ORDER BY c.name
+            """
+        ).fetchall()
+    return {"categories": [row_to_dict(row) for row in rows]}
+
+
+@app.post("/api/categories")
+def create_category(name: str = Form(...)) -> dict[str, Any]:
+    name = name.strip()[:120]
+    if not name or name == UNCATEGORIZED:
+        raise HTTPException(status_code=400, detail="Nome categoria non valido")
+    with get_connection() as db:
+        db.execute(
+            "INSERT INTO categories (name) VALUES (%s) ON CONFLICT (name) DO NOTHING", (name,)
+        )
+        db.commit()
+    return {"name": name}
+
+
+@app.delete("/api/categories/{name}")
+def delete_category(name: str) -> dict[str, Any]:
+    # Remove the category; its videos fall back to "uncategorized" (kept, not deleted).
+    with get_connection() as db:
+        db.execute("DELETE FROM categories WHERE name = %s", (name,))
+        db.execute(
+            "UPDATE videos SET category = %s, updated_at = now() WHERE category = %s",
+            (UNCATEGORIZED, name),
+        )
+        db.commit()
+    return {"deleted": name}
+
+
+@app.put("/api/videos/{video_id}/category")
+def set_video_category(video_id: int, category: str = Form("")) -> dict[str, Any]:
+    category = category.strip()[:120] or UNCATEGORIZED
+    with get_connection() as db:
+        if not db.execute("SELECT 1 FROM videos WHERE id = %s", (video_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="Video non trovato")
+        # Creating-by-assignment: register the category unless it is the sentinel.
+        if category != UNCATEGORIZED:
+            db.execute(
+                "INSERT INTO categories (name) VALUES (%s) ON CONFLICT (name) DO NOTHING",
+                (category,),
+            )
+        db.execute(
+            "UPDATE videos SET category = %s, updated_at = now() WHERE id = %s",
+            (category, video_id),
+        )
+        db.commit()
+    return {"id": video_id, "category": category}
+
+
 @app.get("/api/videos/{video_id}")
 def get_video(video_id: int) -> dict[str, Any]:
     with get_connection() as db:
@@ -141,7 +207,58 @@ def get_video(video_id: int) -> dict[str, Any]:
 
 
 CHAT_CONTEXT_CHARS = 60000
-CHAT_HISTORY_LIMIT = 20
+
+# Tavily web search for the chat agent. When the key is set, the model gets a
+# `web_search` tool it can call when the answer isn't in the video.
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+TAVILY_MAX_RESULTS = int(os.getenv("TAVILY_MAX_RESULTS", "5"))
+CHAT_MAX_TOOL_ITERATIONS = 3
+WEB_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": (
+            "Cerca informazioni aggiornate sul web. Usalo solo quando la risposta non è "
+            "presente nel contenuto del video o servono dati recenti. Restituisce risultati "
+            "con titolo, url ed estratto."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "La query di ricerca."}
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+
+def tavily_search(query: str) -> list[dict[str, Any]]:
+    if not TAVILY_API_KEY:
+        return [{"error": "Ricerca web non configurata"}]
+    payload = json.dumps(
+        {
+            "api_key": TAVILY_API_KEY,
+            "query": query,
+            "max_results": TAVILY_MAX_RESULTS,
+            "search_depth": "basic",
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        "https://api.tavily.com/search",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = json.loads(response.read())
+    except Exception as exc:  # network/HTTP errors must not break the chat
+        return [{"error": f"Ricerca web fallita: {exc}"}]
+    return [
+        {"title": r.get("title"), "url": r.get("url"), "content": r.get("content")}
+        for r in data.get("results", [])
+    ]
 
 
 @app.get("/api/videos/{video_id}/chat")
@@ -192,6 +309,65 @@ def post_chat_message(video_id: int, message: str = Form(...)) -> dict[str, Any]
     return {"reply": {"role": "assistant", "content": answer}}
 
 
+@app.delete("/api/videos/{video_id}/chat")
+def reset_chat(video_id: int) -> dict[str, Any]:
+    with get_connection() as db:
+        db.execute("DELETE FROM video_messages WHERE video_id = %s", (video_id,))
+        db.commit()
+    return {"messages": []}
+
+
+@app.post("/api/videos/{video_id}/chat/compact")
+def compact_chat(video_id: int) -> dict[str, Any]:
+    # Condense the conversation into a single recap message, freeing context while
+    # keeping the gist for future turns.
+    if not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY non configurata")
+    with get_connection() as db:
+        rows = db.execute(
+            "SELECT role, content FROM video_messages WHERE video_id = %s ORDER BY id",
+            (video_id,),
+        ).fetchall()
+        if not rows:
+            return {"messages": []}
+        recap = summarize_conversation([row_to_dict(r) for r in rows])
+        db.execute("DELETE FROM video_messages WHERE video_id = %s", (video_id,))
+        db.execute(
+            "INSERT INTO video_messages (video_id, role, content) VALUES (%s, 'assistant', %s)",
+            (video_id, f"📝 Riepilogo conversazione precedente:\n{recap}"),
+        )
+        db.commit()
+        new_rows = db.execute(
+            "SELECT role, content, created_at FROM video_messages WHERE video_id = %s ORDER BY id",
+            (video_id,),
+        ).fetchall()
+    return {"messages": [row_to_dict(r) for r in new_rows]}
+
+
+def summarize_conversation(messages: list[dict[str, Any]]) -> str:
+    client = OpenAI()
+    convo = "\n".join(f"{m.get('role')}: {m.get('content')}" for m in messages)
+    try:
+        response = client.chat.completions.create(
+            model=SUMMARY_MODEL,
+            messages=[
+                {"role": "system", "content": "Riassumi conversazioni in italiano in modo fedele e conciso."},
+                {
+                    "role": "user",
+                    "content": (
+                        "Riassumi la seguente conversazione in un recap conciso ma completo, "
+                        "mantenendo informazioni, domande e conclusioni utili per proseguire.\n\n"
+                        + convo
+                    ),
+                },
+            ],
+            temperature=0.2,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Compattazione chat fallita: {str(exc)}") from exc
+    return response.choices[0].message.content or ""
+
+
 def chat_with_video(
     video: dict[str, Any], history: list[dict[str, Any]], message: str
 ) -> str:
@@ -205,28 +381,77 @@ def chat_with_video(
             translation = "\n".join(str(s.get("text") or "") for s in segments)[:CHAT_CONTEXT_CHARS]
         except (TypeError, ValueError):
             translation = ""
+    web_enabled = bool(TAVILY_API_KEY)
     system = (
-        "Sei un assistente che risponde a domande su un singolo video, basandoti SOLO "
-        "sul suo contenuto (trascrizione e riassunto). Rispondi sempre in italiano, in modo "
-        "conciso e accurato. Se l'informazione non è presente nel video, dillo chiaramente.\n\n"
+        "Sei un assistente che risponde a domande su un singolo video, basandoti "
+        "principalmente sul suo contenuto (trascrizione e riassunto). Rispondi sempre in "
+        "italiano, in modo conciso e accurato.\n\n"
         f"Titolo: {video.get('title', '')}\n\n"
         f"Riassunto:\n{summary_long}\n\n"
         f"Trascrizione:\n{transcript}\n"
     )
     if translation:
         system += f"\nTraduzione italiana della trascrizione:\n{translation}\n"
-    messages: list[dict[str, str]] = [{"role": "system", "content": system}]
-    for item in history[-CHAT_HISTORY_LIMIT:]:
+    if web_enabled:
+        system += (
+            "\nHai a disposizione lo strumento `web_search`. Usalo SOLO quando l'informazione "
+            "non è presente nel video o servono dati aggiornati. Quando usi il web, cita le "
+            "fonti (URL). Dai sempre priorità al contenuto del video.\n"
+        )
+    else:
+        system += "\nSe l'informazione non è presente nel video, dillo chiaramente.\n"
+
+    # Full history is kept and sent (the user manages size via Compatta/Reset).
+    messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
+    for item in history:
         if item.get("role") in ("user", "assistant"):
             messages.append({"role": item["role"], "content": item.get("content") or ""})
     messages.append({"role": "user", "content": message})
+
+    tools = [WEB_SEARCH_TOOL] if web_enabled else None
     try:
-        response = client.chat.completions.create(
+        for _ in range(CHAT_MAX_TOOL_ITERATIONS):
+            kwargs: dict[str, Any] = {"model": SUMMARY_MODEL, "messages": messages, "temperature": 0.3}
+            if tools:
+                kwargs["tools"] = tools
+                kwargs["tool_choice"] = "auto"
+            reply = client.chat.completions.create(**kwargs).choices[0].message
+            if not reply.tool_calls:
+                return reply.content or ""
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": reply.content or "",
+                    "tool_calls": [
+                        {
+                            "id": call.id,
+                            "type": "function",
+                            "function": {"name": call.function.name, "arguments": call.function.arguments},
+                        }
+                        for call in reply.tool_calls
+                    ],
+                }
+            )
+            for call in reply.tool_calls:
+                if call.function.name == "web_search":
+                    args = json.loads(call.function.arguments or "{}")
+                    result = tavily_search(str(args.get("query", "")))
+                else:
+                    result = [{"error": "Strumento non disponibile"}]
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": json.dumps(result, ensure_ascii=False),
+                    }
+                )
+        # Tool budget exhausted: force a final text answer without more tools.
+        final = client.chat.completions.create(
             model=SUMMARY_MODEL, messages=messages, temperature=0.3
         )
+        return final.choices[0].message.content or ""
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Chat LLM fallita: {str(exc)}") from exc
-    return response.choices[0].message.content or ""
 
 
 def estimate_costs(
@@ -1015,6 +1240,12 @@ def save_video(
                 translation_json,
             ),
         ).fetchone()["id"]
+        # Register the (AI-assigned) category in the canonical list.
+        if category and category != UNCATEGORIZED:
+            db.execute(
+                "INSERT INTO categories (name) VALUES (%s) ON CONFLICT (name) DO NOTHING",
+                (category,),
+            )
         db.commit()
         row = db.execute("SELECT * FROM videos WHERE id = %s", (new_id,)).fetchone()
     saved = row_to_dict(row)

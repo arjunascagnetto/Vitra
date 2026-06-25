@@ -16,6 +16,8 @@ const els = {
   detailPanel: document.querySelector("#detail .detail"),
   confirm: document.querySelector("#confirm"),
   settings: document.querySelector("#settings"),
+  categoriesDialog: document.querySelector("#categories"),
+  manageCategories: document.querySelector("#manage-categories"),
   search: document.querySelector("#search"),
   categoryFilter: document.querySelector("#category-filter"),
 };
@@ -253,6 +255,93 @@ function formatCost(value) {
 
 els.search.addEventListener("input", debounce(loadVideos, 250));
 els.categoryFilter.addEventListener("change", loadVideos);
+els.manageCategories.addEventListener("click", openCategoriesManager);
+wireDialogClose(els.categoriesDialog);
+
+function wireDialogClose(dlg) {
+  const close = () => {
+    if (dlg.open) dlg.close();
+  };
+  dlg.querySelector("[data-cancel]").addEventListener("click", close);
+  dlg.addEventListener("cancel", close);
+  dlg.addEventListener("click", (event) => {
+    if (event.target === dlg) close();
+  });
+}
+
+async function openCategoriesManager() {
+  const dlg = els.categoriesDialog;
+  const body = dlg.querySelector(".categories-body");
+
+  const render = async () => {
+    let categories = [];
+    try {
+      categories = (await readJson(await fetch("/api/categories"))).categories;
+    } catch (error) {
+      body.innerHTML = `<div class="chat-empty">${escapeHtml(error.message)}</div>`;
+      return;
+    }
+    const items = categories
+      .map(
+        (c) => `
+        <li>
+          <span>${escapeHtml(c.name)} <span class="cost-model">${c.count}</span></span>
+          <button type="button" class="poster-delete cat-del" data-del="${escapeHtml(c.name)}" aria-label="Elimina" title="Elimina">${TRASH_ICON}</button>
+        </li>`
+      )
+      .join("");
+    body.innerHTML = `
+      <div class="category-create">
+        <input data-new-cat type="text" autocomplete="off" placeholder="Nuova categoria…" />
+        <button type="button" data-create-cat>Crea</button>
+      </div>
+      <ul class="category-list">${items || '<li class="chat-empty">Nessuna categoria.</li>'}</ul>`;
+
+    const input = body.querySelector("[data-new-cat]");
+    const create = async () => {
+      const name = input.value.trim();
+      if (!name) return;
+      try {
+        const fd = new FormData();
+        fd.set("name", name);
+        await readJson(await fetch("/api/categories", { method: "POST", body: fd }));
+        await render();
+      } catch (error) {
+        setStatus(error.message, true);
+      }
+    };
+    body.querySelector("[data-create-cat]").addEventListener("click", create);
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        create();
+      }
+    });
+    body.querySelectorAll("[data-del]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const name = button.dataset.del;
+        const ok = await openConfirm({
+          title: "Elimina categoria",
+          bodyHtml: `<p>Eliminare la categoria <strong>${escapeHtml(name)}</strong>?</p>
+            <p class="confirm-note">I video associati resteranno senza categoria.</p>`,
+          confirmLabel: "Elimina",
+          danger: true,
+        });
+        if (!ok) return;
+        try {
+          await readJson(await fetch(`/api/categories/${encodeURIComponent(name)}`, { method: "DELETE" }));
+          await render();
+          await loadVideos();
+        } catch (error) {
+          setStatus(error.message, true);
+        }
+      });
+    });
+  };
+
+  await render();
+  if (!dlg.open) dlg.showModal();
+}
 
 async function loadVideos() {
   const params = new URLSearchParams();
@@ -373,7 +462,10 @@ function renderDetail() {
   els.detailPanel.innerHTML = `
     <div class="detail-head">
       <div>
-        <span class="pill">${escapeHtml(video.category)}</span>
+        <div class="category-pill-wrap">
+          <button class="pill pill-button" type="button" data-category-edit title="Cambia categoria">${escapeHtml(video.category || "Senza categoria")} ▾</button>
+          <div class="category-menu" data-category-menu hidden></div>
+        </div>
         <h2>${escapeHtml(video.title)}</h2>
         <p class="meta">${escapeHtml(video.uploader || "")} ${video.webpage_url ? `· <a href="${escapeHtml(video.webpage_url)}" target="_blank" rel="noreferrer">Apri video</a>` : ""}${video.estimated_cost_usd != null ? ` · Costo stimato: ${formatCost(video.estimated_cost_usd)}` : ""}</p>
       </div>
@@ -404,6 +496,10 @@ function renderDetail() {
                  placeholder="Fai una domanda su questo video…" />
                <button type="submit">Invia</button>
              </form>
+             <div class="chat-actions">
+               <button type="button" class="secondary" data-chat-compact>Compatta</button>
+               <button type="button" class="secondary" data-chat-reset>Reset</button>
+             </div>
            </div>`
         : `<div class="text-block ${state.activeTab !== "transcript" ? "markdown" : ""}">${body}</div>`
     }
@@ -419,6 +515,78 @@ function renderDetail() {
     });
   });
   if (state.activeTab === "chat") setupChat(video);
+
+  const pill = els.detailPanel.querySelector("[data-category-edit]");
+  const menu = els.detailPanel.querySelector("[data-category-menu]");
+  if (pill && menu) {
+    pill.addEventListener("click", async () => {
+      if (!menu.hidden) {
+        menu.hidden = true;
+        return;
+      }
+      menu.hidden = false;
+      await populateCategoryMenu(video, menu);
+    });
+  }
+}
+
+async function populateCategoryMenu(video, menu) {
+  menu.innerHTML = '<div class="chat-empty">Caricamento…</div>';
+  let categories = [];
+  try {
+    categories = (await readJson(await fetch("/api/categories"))).categories;
+  } catch (error) {
+    menu.innerHTML = `<div class="chat-empty">${escapeHtml(error.message)}</div>`;
+    return;
+  }
+  const options = categories
+    .map(
+      (c) =>
+        `<button type="button" class="category-option${
+          c.name === video.category ? " current" : ""
+        }" data-cat="${escapeHtml(c.name)}">${escapeHtml(c.name)}</button>`
+    )
+    .join("");
+  menu.innerHTML = `
+    <div class="category-options">${options || '<div class="chat-empty">Nessuna categoria.</div>'}</div>
+    <div class="category-create">
+      <input data-new-cat type="text" autocomplete="off" placeholder="Crea nuova…" />
+      <button type="button" data-create-cat title="Crea e assegna">＋</button>
+    </div>`;
+  menu.querySelectorAll(".category-option").forEach((button) => {
+    button.addEventListener("click", () => assignCategory(video.id, button.dataset.cat));
+  });
+  const input = menu.querySelector("[data-new-cat]");
+  const create = () => {
+    const name = input.value.trim();
+    if (name) assignCategory(video.id, name);
+  };
+  menu.querySelector("[data-create-cat]").addEventListener("click", create);
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      create();
+    }
+  });
+  input.focus();
+}
+
+async function assignCategory(videoId, name) {
+  try {
+    const body = new FormData();
+    body.set("category", name);
+    const data = await readJson(
+      await fetch(`/api/videos/${videoId}/category`, { method: "PUT", body })
+    );
+    if (state.selectedVideo && state.selectedVideo.id === videoId) {
+      state.selectedVideo.category = data.category;
+    }
+    await loadVideos();
+    renderDetail();
+    setStatus(`Categoria aggiornata: ${data.category}.`);
+  } catch (error) {
+    setStatus(error.message, true);
+  }
 }
 
 function renderTabButtons(video) {
@@ -477,6 +645,8 @@ async function setupChat(video) {
   const messagesEl = els.detailPanel.querySelector("[data-chat-messages]");
   const form = els.detailPanel.querySelector("[data-chat-form]");
   const input = els.detailPanel.querySelector("[data-chat-input]");
+  const compactBtn = els.detailPanel.querySelector("[data-chat-compact]");
+  const resetBtn = els.detailPanel.querySelector("[data-chat-reset]");
   if (!messagesEl || !form || !input) return;
 
   const appendMessage = (role, content) => {
@@ -488,18 +658,55 @@ async function setupChat(video) {
     return bubble;
   };
 
-  messagesEl.innerHTML = '<div class="chat-empty">Caricamento…</div>';
-  try {
-    const data = await readJson(await fetch(`/api/videos/${video.id}/chat`));
+  const renderMessages = (messages) => {
     messagesEl.innerHTML = "";
-    if (!data.messages.length) {
+    if (!messages.length) {
       messagesEl.innerHTML = '<div class="chat-empty">Nessun messaggio. Fai una domanda sul video.</div>';
     } else {
-      data.messages.forEach((m) => appendMessage(m.role, m.content));
+      messages.forEach((m) => appendMessage(m.role, m.content));
     }
+  };
+
+  messagesEl.innerHTML = '<div class="chat-empty">Caricamento…</div>';
+  try {
+    renderMessages((await readJson(await fetch(`/api/videos/${video.id}/chat`))).messages);
   } catch (error) {
     messagesEl.innerHTML = `<div class="chat-empty">${escapeHtml(error.message)}</div>`;
   }
+
+  compactBtn.addEventListener("click", async () => {
+    compactBtn.disabled = true;
+    resetBtn.disabled = true;
+    try {
+      const data = await readJson(
+        await fetch(`/api/videos/${video.id}/chat/compact`, { method: "POST" })
+      );
+      renderMessages(data.messages);
+    } catch (error) {
+      setStatus(error.message, true);
+    } finally {
+      compactBtn.disabled = false;
+      resetBtn.disabled = false;
+    }
+  });
+
+  resetBtn.addEventListener("click", async () => {
+    const ok = await openConfirm({
+      title: "Reset chat",
+      bodyHtml: "<p>Cancellare tutta la cronologia di questa chat?</p>",
+      confirmLabel: "Reset",
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      const data = await readJson(
+        await fetch(`/api/videos/${video.id}/chat`, { method: "DELETE" })
+      );
+      renderMessages(data.messages);
+    } catch (error) {
+      setStatus(error.message, true);
+    }
+  });
 
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -569,7 +776,7 @@ els.detail.addEventListener("click", (event) => {
 function groupedByCategory(videos) {
   const groups = new Map();
   for (const video of videos) {
-    const category = video.category || "Generale";
+    const category = video.category || "Senza categoria";
     if (!groups.has(category)) groups.set(category, []);
     groups.get(category).push(video);
   }
