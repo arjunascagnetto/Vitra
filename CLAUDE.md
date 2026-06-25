@@ -145,7 +145,8 @@ The whole backend is two files plus a static frontend.
   A separate **corpus-wide chat** (`GET/POST/DELETE /api/chat`, `general_chat`,
   persisted in `general_messages`) answers across all videos: the system prompt holds a
   catalog (id/category/short+long summaries) of the in-scope videos, and the model reads
-  full transcripts on demand via a `get_transcript` tool (plus `web_search`). The
+  full transcripts (`get_transcript`) and per-video chat histories (`get_video_chat`,
+  scoped to in-scope videos) on demand, plus `web_search`. The
   "Chat archivio" dialog has per-category multi-select toggles that scope which videos
   are included (none selected = all); the selected category names are sent as `categories`. `language_hint` is now
   the **source/transcription language only**; export adds a `translation` kind.

@@ -248,6 +248,21 @@ GET_TRANSCRIPT_TOOL = {
         },
     },
 }
+GET_VIDEO_CHAT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_video_chat",
+        "description": (
+            "Restituisce la cronologia della chat per-video (domande e risposte già fatte su "
+            "quel singolo video) dato il suo id. Utile per riusare conversazioni precedenti."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"video_id": {"type": "integer", "description": "L'id del video."}},
+            "required": ["video_id"],
+        },
+    },
+}
 GENERAL_CHAT_MAX_ITERATIONS = 6
 GENERAL_TRANSCRIPT_CHARS = 40000
 GENERAL_SUMMARY_LONG_CHARS = 1500
@@ -548,7 +563,8 @@ def general_chat(history: list[dict[str, Any]], message: str, categories: list[s
         "Sei un assistente che risponde basandoti su un archivio di video (riassunti e "
         "trascrizioni). Rispondi sempre in italiano e cita i video pertinenti per titolo. "
         "Hai il catalogo qui sotto con id, categoria e riassunti breve/lungo. Per leggere la "
-        "trascrizione completa di un video usa lo strumento get_transcript con il suo id.\n"
+        "trascrizione completa di un video usa lo strumento get_transcript con il suo id; per "
+        "rileggere le conversazioni già avute sulla chat di un singolo video usa get_video_chat.\n"
     )
     if web_enabled:
         system += (
@@ -562,7 +578,7 @@ def general_chat(history: list[dict[str, Any]], message: str, categories: list[s
             messages.append({"role": item["role"], "content": item.get("content") or ""})
     messages.append({"role": "user", "content": message})
 
-    tools = [GET_TRANSCRIPT_TOOL] + ([WEB_SEARCH_TOOL] if web_enabled else [])
+    tools = [GET_TRANSCRIPT_TOOL, GET_VIDEO_CHAT_TOOL] + ([WEB_SEARCH_TOOL] if web_enabled else [])
     allowed_ids = set(transcripts)
     try:
         for _ in range(GENERAL_CHAT_MAX_ITERATIONS):
@@ -591,6 +607,17 @@ def general_chat(history: list[dict[str, Any]], message: str, categories: list[s
                     vid = int(args.get("video_id", 0) or 0)
                     if vid in allowed_ids:
                         result: Any = {"video_id": vid, "transcript": transcripts[vid][:GENERAL_TRANSCRIPT_CHARS]}
+                    else:
+                        result = {"error": "Video non disponibile nello scope selezionato"}
+                elif call.function.name == "get_video_chat":
+                    vid = int(args.get("video_id", 0) or 0)
+                    if vid in allowed_ids:
+                        with get_connection() as cdb:
+                            chat_rows = cdb.execute(
+                                "SELECT role, content FROM video_messages WHERE video_id = %s ORDER BY id",
+                                (vid,),
+                            ).fetchall()
+                        result = {"video_id": vid, "chat": [row_to_dict(m) for m in chat_rows]}
                     else:
                         result = {"error": "Video non disponibile nello scope selezionato"}
                 elif call.function.name == "web_search":
