@@ -8,5 +8,6 @@ imageio-ffmpeg==0.6.0
 psycopg[binary]==3.2.3
 pgvector==0.3.6
 faster-whisper==1.2.1
+tiktoken==0.13.0
 # Per la trascrizione locale su GPU installa torch dal CUDA index (non da PyPI):
 #   pip install torch --index-url https://download.pytorch.org/whl/cu124

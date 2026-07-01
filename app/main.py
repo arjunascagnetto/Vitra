@@ -49,8 +49,11 @@ WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "default")
 OPENAI_AUDIO_LIMIT_BYTES = 24 * 1024 * 1024
 # Sentinel for videos with no category; never stored in the `categories` table.
 UNCATEGORIZED = "Senza categoria"
-# Keep embedding input well under the model's 8191-token limit (~4 chars/token).
+# Keep embedding input well under the model's 8192-token limit. EMBEDDING_INPUT_CHARS
+# is a coarse first cut (~4 chars/token); embed_text then truncates precisely by
+# tokens (tiktoken) to guarantee we stay under EMBEDDING_MAX_TOKENS.
 EMBEDDING_INPUT_CHARS = 24000
+EMBEDDING_MAX_TOKENS = 8000
 AUDIO_DIR = DATA_DIR / "audio"
 
 app = FastAPI(title="Video Transcript GUI")
@@ -897,9 +900,29 @@ def build_embedding_text(metadata: dict[str, Any], summary: str, transcript_text
     return combined[:EMBEDDING_INPUT_CHARS]
 
 
+def truncate_to_tokens(text: str, max_tokens: int = EMBEDDING_MAX_TOKENS) -> str:
+    # text-embedding-3-* have an 8192-token context limit; a char cap is not a
+    # reliable proxy (token/char ratio varies by language). Truncate by tokens
+    # with tiktoken when available, otherwise fall back to a conservative char cap.
+    try:
+        import tiktoken
+
+        try:
+            encoding = tiktoken.encoding_for_model(EMBEDDING_MODEL)
+        except KeyError:
+            encoding = tiktoken.get_encoding("cl100k_base")
+        tokens = encoding.encode(text)
+        if len(tokens) <= max_tokens:
+            return text
+        return encoding.decode(tokens[:max_tokens])
+    except Exception:
+        # ~3 chars/token is conservative enough to stay under the limit.
+        return text[: max_tokens * 3]
+
+
 def embed_text(text: str) -> list[float]:
     client = OpenAI()
-    cleaned = (text or "").strip()[:EMBEDDING_INPUT_CHARS] or " "
+    cleaned = truncate_to_tokens((text or "").strip()) or " "
     try:
         response = client.embeddings.create(model=EMBEDDING_MODEL, input=cleaned)
     except Exception as exc:
