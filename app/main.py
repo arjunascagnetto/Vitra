@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -55,6 +58,7 @@ UNCATEGORIZED = "Senza categoria"
 EMBEDDING_INPUT_CHARS = 24000
 EMBEDDING_MAX_TOKENS = 8000
 AUDIO_DIR = DATA_DIR / "audio"
+REPORTS_DIR = DATA_DIR / "reports"
 
 app = FastAPI(title="Video Transcript GUI")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -266,6 +270,27 @@ GET_VIDEO_CHAT_TOOL = {
         },
     },
 }
+EXPORT_REPORT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "export_report",
+        "description": (
+            "Esporta in un PDF scaricabile l'ultima risposta generata in questa "
+            "conversazione (la usi quando l'utente chiede di esportare o salvare in PDF). "
+            "Salva il report e restituisce l'URL di download: mostralo poi all'utente come "
+            "link markdown [titolo](url)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Titolo breve del report (opzionale).",
+                }
+            },
+        },
+    },
+}
 GENERAL_CHAT_MAX_ITERATIONS = 6
 GENERAL_TRANSCRIPT_CHARS = 40000
 GENERAL_SUMMARY_LONG_CHARS = 1500
@@ -299,6 +324,18 @@ def tavily_search(query: str) -> list[dict[str, Any]]:
     ]
 
 
+def collect_web_sources(results: Any) -> list[dict[str, Any]]:
+    # Keep only real hits (title + url) from a tavily_search result, for report
+    # provenance. Error/empty payloads yield nothing.
+    if not isinstance(results, list):
+        return []
+    return [
+        {"title": r.get("title"), "url": r.get("url")}
+        for r in results
+        if isinstance(r, dict) and r.get("url")
+    ]
+
+
 @app.get("/api/videos/{video_id}/chat")
 def list_chat_messages(video_id: int) -> dict[str, Any]:
     with get_connection() as db:
@@ -321,7 +358,7 @@ def post_chat_message(video_id: int, message: str = Form(...)) -> dict[str, Any]
     with get_connection() as db:
         video = db.execute(
             """
-            SELECT title, summary_long, summary, transcript, translation_json
+            SELECT id, title, summary_long, summary, transcript, translation_json
             FROM videos WHERE id = %s
             """,
             (video_id,),
@@ -332,7 +369,7 @@ def post_chat_message(video_id: int, message: str = Form(...)) -> dict[str, Any]
             "SELECT role, content FROM video_messages WHERE video_id = %s ORDER BY id",
             (video_id,),
         ).fetchall()
-        answer = chat_with_video(
+        answer, refs = chat_with_video(
             row_to_dict(video), [row_to_dict(h) for h in history], message
         )
         db.execute(
@@ -340,8 +377,8 @@ def post_chat_message(video_id: int, message: str = Form(...)) -> dict[str, Any]
             (video_id, message),
         )
         db.execute(
-            "INSERT INTO video_messages (video_id, role, content) VALUES (%s, 'assistant', %s)",
-            (video_id, answer),
+            "INSERT INTO video_messages (video_id, role, content, refs_json) VALUES (%s, 'assistant', %s, %s)",
+            (video_id, answer, json.dumps(refs, ensure_ascii=False)),
         )
         db.commit()
     return {"reply": {"role": "assistant", "content": answer}}
@@ -408,7 +445,7 @@ def summarize_conversation(messages: list[dict[str, Any]]) -> str:
 
 def chat_with_video(
     video: dict[str, Any], history: list[dict[str, Any]], message: str
-) -> str:
+) -> tuple[str, dict[str, Any]]:
     client = OpenAI()
     transcript = (video.get("transcript") or "")[:CHAT_CONTEXT_CHARS]
     summary_long = video.get("summary_long") or video.get("summary") or ""
@@ -438,6 +475,11 @@ def chat_with_video(
         )
     else:
         system += "\nSe l'informazione non è presente nel video, dillo chiaramente.\n"
+    system += (
+        "\nQuando l'utente chiede di esportare o salvare in PDF l'ultima risposta, chiama lo "
+        "strumento `export_report` e poi mostra all'utente il campo `download_url` restituito "
+        "come link markdown, es. [Scarica il PDF](download_url).\n"
+    )
 
     # Full history is kept and sent (the user manages size via Compatta/Reset).
     messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
@@ -446,16 +488,30 @@ def chat_with_video(
             messages.append({"role": item["role"], "content": item.get("content") or ""})
     messages.append({"role": "user", "content": message})
 
-    tools = [WEB_SEARCH_TOOL] if web_enabled else None
+    # export_report is always available; web_search only when Tavily is configured.
+    tools = ([WEB_SEARCH_TOOL] if web_enabled else []) + [EXPORT_REPORT_TOOL]
+
+    video_id = video.get("id")
+    web_sources: list[dict[str, Any]] = []
+
+    def build_refs() -> dict[str, Any]:
+        # The per-video chat is grounded in exactly this video.
+        return {
+            "video_ids": [video_id] if video_id else [],
+            "web_sources": web_sources,
+        }
+
     try:
         for _ in range(CHAT_MAX_TOOL_ITERATIONS):
-            kwargs: dict[str, Any] = {"model": SUMMARY_MODEL, "messages": messages, "temperature": 0.3}
-            if tools:
-                kwargs["tools"] = tools
-                kwargs["tool_choice"] = "auto"
-            reply = client.chat.completions.create(**kwargs).choices[0].message
+            reply = client.chat.completions.create(
+                model=SUMMARY_MODEL,
+                messages=messages,
+                temperature=0.3,
+                tools=tools,
+                tool_choice="auto",
+            ).choices[0].message
             if not reply.tool_calls:
-                return reply.content or ""
+                return reply.content or "", build_refs()
             messages.append(
                 {
                     "role": "assistant",
@@ -471,9 +527,13 @@ def chat_with_video(
                 }
             )
             for call in reply.tool_calls:
+                args = json.loads(call.function.arguments or "{}")
                 if call.function.name == "web_search":
-                    args = json.loads(call.function.arguments or "{}")
-                    result = tavily_search(str(args.get("query", "")))
+                    result: Any = tavily_search(str(args.get("query", "")))
+                    web_sources.extend(collect_web_sources(result))
+                elif call.function.name == "export_report":
+                    scope = f"video:{video_id}" if video_id else "general"
+                    result = create_report(scope, video_id, args.get("title"))
                 else:
                     result = [{"error": "Strumento non disponibile"}]
                 messages.append(
@@ -487,7 +547,9 @@ def chat_with_video(
         final = client.chat.completions.create(
             model=SUMMARY_MODEL, messages=messages, temperature=0.3
         )
-        return final.choices[0].message.content or ""
+        return final.choices[0].message.content or "", build_refs()
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Chat LLM fallita: {str(exc)}") from exc
 
@@ -516,10 +578,11 @@ def post_general_message(
         history = db.execute(
             "SELECT role, content FROM general_messages ORDER BY id"
         ).fetchall()
-        answer = general_chat([row_to_dict(h) for h in history], message, selected)
+        answer, refs = general_chat([row_to_dict(h) for h in history], message, selected)
         db.execute("INSERT INTO general_messages (role, content) VALUES ('user', %s)", (message,))
         db.execute(
-            "INSERT INTO general_messages (role, content) VALUES ('assistant', %s)", (answer,)
+            "INSERT INTO general_messages (role, content, refs_json) VALUES ('assistant', %s, %s)",
+            (answer, json.dumps(refs, ensure_ascii=False)),
         )
         db.commit()
     return {"reply": {"role": "assistant", "content": answer}}
@@ -533,7 +596,47 @@ def reset_general_chat() -> dict[str, Any]:
     return {"messages": []}
 
 
-def general_chat(history: list[dict[str, Any]], message: str, categories: list[str]) -> str:
+@app.get("/api/reports")
+def list_reports() -> dict[str, Any]:
+    with get_connection() as db:
+        rows = db.execute(
+            """
+            SELECT hash, title, scope, source_video_ids, web_sources, created_at
+            FROM reports ORDER BY id DESC
+            """
+        ).fetchall()
+    reports = []
+    for row in rows:
+        item = row_to_dict(row)
+        item["source_video_ids"] = json.loads(item.get("source_video_ids") or "[]")
+        item["web_sources"] = json.loads(item.get("web_sources") or "[]")
+        item["download_url"] = f"/api/reports/{item['hash']}.pdf"
+        reports.append(item)
+    return {"reports": reports}
+
+
+@app.get("/api/reports/{report_hash}.pdf")
+def download_report(report_hash: str) -> FileResponse:
+    # Content-addressed download: the filename is the sha256 in the reports table.
+    if not re.fullmatch(r"[0-9a-f]{64}", report_hash):
+        raise HTTPException(status_code=404, detail="Report non trovato")
+    with get_connection() as db:
+        row = db.execute(
+            "SELECT title FROM reports WHERE hash = %s", (report_hash,)
+        ).fetchone()
+    pdf_path = REPORTS_DIR / f"{report_hash}.pdf"
+    if not row or not pdf_path.exists():
+        raise HTTPException(status_code=404, detail="Report non trovato")
+    return FileResponse(
+        pdf_path,
+        media_type="application/pdf",
+        filename=f"{safe_filename(row['title'])}.pdf",
+    )
+
+
+def general_chat(
+    history: list[dict[str, Any]], message: str, categories: list[str]
+) -> tuple[str, dict[str, Any]]:
     client = OpenAI()
     with get_connection() as db:
         if categories:
@@ -573,6 +676,11 @@ def general_chat(history: list[dict[str, Any]], message: str, categories: list[s
         system += (
             "Per informazioni non presenti nell'archivio puoi usare web_search; cita le fonti (URL).\n"
         )
+    system += (
+        "Quando l'utente chiede di esportare o salvare in PDF l'ultima risposta, chiama lo "
+        "strumento export_report e poi mostra il campo download_url restituito come link "
+        "markdown, es. [Scarica il PDF](download_url).\n"
+    )
     system += f"\nScope: {scope}.\n\nCatalogo video:\n{catalog}\n"
 
     messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
@@ -581,15 +689,41 @@ def general_chat(history: list[dict[str, Any]], message: str, categories: list[s
             messages.append({"role": item["role"], "content": item.get("content") or ""})
     messages.append({"role": "user", "content": message})
 
-    tools = [GET_TRANSCRIPT_TOOL, GET_VIDEO_CHAT_TOOL] + ([WEB_SEARCH_TOOL] if web_enabled else [])
+    tools = [
+        GET_TRANSCRIPT_TOOL,
+        GET_VIDEO_CHAT_TOOL,
+        EXPORT_REPORT_TOOL,
+    ] + ([WEB_SEARCH_TOOL] if web_enabled else [])
     allowed_ids = set(transcripts)
+
+    # Track which videos/web sources actually informed this turn, so a later
+    # "esporta" can attribute the report (see create_report / refs_json).
+    used_video_ids: set[int] = set()
+    web_sources: list[dict[str, Any]] = []
+
+    def build_refs(answer: str) -> dict[str, Any]:
+        # Provenance = videos read via tools ∪ catalog videos cited by title in the
+        # answer; fall back to the in-scope catalog so it's never empty for a real
+        # answer (the model reasons over the catalog summaries even without tools).
+        text = (answer or "").lower()
+        cited = {
+            v["id"]
+            for v in videos
+            if (v.get("title") or "").strip() and v["title"].lower() in text
+        }
+        ids = used_video_ids | cited
+        if not ids:
+            ids = set(allowed_ids)
+        return {"video_ids": sorted(ids), "web_sources": web_sources}
+
     try:
         for _ in range(GENERAL_CHAT_MAX_ITERATIONS):
             reply = client.chat.completions.create(
                 model=SUMMARY_MODEL, messages=messages, temperature=0.3, tools=tools, tool_choice="auto"
             ).choices[0].message
             if not reply.tool_calls:
-                return reply.content or ""
+                answer = reply.content or ""
+                return answer, build_refs(answer)
             messages.append(
                 {
                     "role": "assistant",
@@ -609,12 +743,14 @@ def general_chat(history: list[dict[str, Any]], message: str, categories: list[s
                 if call.function.name == "get_transcript":
                     vid = int(args.get("video_id", 0) or 0)
                     if vid in allowed_ids:
+                        used_video_ids.add(vid)
                         result: Any = {"video_id": vid, "transcript": transcripts[vid][:GENERAL_TRANSCRIPT_CHARS]}
                     else:
                         result = {"error": "Video non disponibile nello scope selezionato"}
                 elif call.function.name == "get_video_chat":
                     vid = int(args.get("video_id", 0) or 0)
                     if vid in allowed_ids:
+                        used_video_ids.add(vid)
                         with get_connection() as cdb:
                             chat_rows = cdb.execute(
                                 "SELECT role, content FROM video_messages WHERE video_id = %s ORDER BY id",
@@ -625,6 +761,9 @@ def general_chat(history: list[dict[str, Any]], message: str, categories: list[s
                         result = {"error": "Video non disponibile nello scope selezionato"}
                 elif call.function.name == "web_search":
                     result = tavily_search(str(args.get("query", "")))
+                    web_sources.extend(collect_web_sources(result))
+                elif call.function.name == "export_report":
+                    result = create_report("general", None, args.get("title"))
                 else:
                     result = {"error": "Strumento non disponibile"}
                 messages.append(
@@ -637,7 +776,10 @@ def general_chat(history: list[dict[str, Any]], message: str, categories: list[s
         final = client.chat.completions.create(
             model=SUMMARY_MODEL, messages=messages, temperature=0.3
         )
-        return final.choices[0].message.content or ""
+        answer = final.choices[0].message.content or ""
+        return answer, build_refs(answer)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Chat generale fallita: {str(exc)}") from exc
 
@@ -1543,17 +1685,165 @@ def build_export_text(video: dict[str, Any], kind: str) -> str:
     return f"{video['title']}\nCategoria: {video['category']}\nURL: {video['url']}\n\n{label}\n\n{body}\n"
 
 
-def write_pdf(path: Path, title: str, content: str) -> None:
-    DATA_DIR.mkdir(exist_ok=True)
+# Unicode-capable TTF for PDF output. The bundled DejaVuSans (Latin + Cyrillic)
+# is preferred and portable; the rest are last-resort fallbacks per platform.
+PDF_FONT_CANDIDATES = [
+    BASE_DIR / "static" / "fonts" / "DejaVuSans.ttf",
+    Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+    Path(r"C:\Windows\Fonts\DejaVuSans.ttf"),
+    Path(r"C:\Windows\Fonts\arial.ttf"),
+    Path(r"C:\Windows\Fonts\segoeui.ttf"),
+]
+
+
+def resolve_pdf_font() -> str:
+    for candidate in PDF_FONT_CANDIDATES:
+        if candidate.exists():
+            return str(candidate)
+    raise HTTPException(
+        status_code=500,
+        detail="Nessun font TTF disponibile per il PDF (atteso static/fonts/DejaVuSans.ttf)",
+    )
+
+
+def render_pdf_bytes(content: str) -> bytes:
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
-    pdf.add_font("DejaVu", "", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
-    pdf.set_font("DejaVu", size=12)
+    pdf.add_font("PDFFont", "", resolve_pdf_font())
+    pdf.set_font("PDFFont", size=12)
     pdf.multi_cell(0, 8, content)
-    pdf.output(path)
+    # fpdf2 returns a bytearray when no destination path is given.
+    return bytes(pdf.output())
+
+
+def write_pdf(path: Path, title: str, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(render_pdf_bytes(content))
 
 
 def safe_filename(value: str) -> str:
     allowed = [char if char.isalnum() or char in ("-", "_") else "-" for char in value.lower()]
     return "".join(allowed).strip("-")[:80] or "video"
+
+
+def first_line(text: str) -> str:
+    for line in (text or "").splitlines():
+        stripped = line.strip().lstrip("#").strip()
+        if stripped:
+            return stripped[:80]
+    return ""
+
+
+def build_report_text(
+    title: str,
+    question: str,
+    answer: str,
+    video_refs: list[dict[str, Any]],
+    web_sources: list[dict[str, Any]],
+) -> str:
+    lines = [title, f"Generato il {datetime.now().strftime('%Y-%m-%d %H:%M')}", ""]
+    if (question or "").strip():
+        lines += ["Domanda:", question.strip(), ""]
+    lines += ["Risposta:", (answer or "").strip(), ""]
+    if video_refs or web_sources:
+        lines.append("Fonti:")
+        for v in video_refs:
+            lines.append(f"- Video [{v['id']}] {(v.get('title') or '').strip()}".rstrip())
+        for s in web_sources:
+            label = s.get("title") or s.get("url") or ""
+            lines.append(f"- Web: {label} ({s.get('url') or ''})")
+    return "\n".join(lines) + "\n"
+
+
+def create_report(scope: str, video_id: int | None, title: str | None) -> dict[str, Any]:
+    # Turn the last assistant answer of a chat into a stored, downloadable PDF.
+    # Content-addressed: the file is named by the sha256 of its bytes, so exporting
+    # the identical interaction twice reuses the same file. Records provenance
+    # (videos consulted + web sources) taken from that message's refs_json.
+    table = "video_messages" if video_id else "general_messages"
+    with get_connection() as db:
+        where = ["role = 'assistant'"]
+        params: list[Any] = []
+        if video_id:
+            where.append("video_id = %s")
+            params.append(video_id)
+        last = db.execute(
+            f"SELECT id, content, refs_json FROM {table} WHERE {' AND '.join(where)} "
+            "ORDER BY id DESC LIMIT 1",
+            tuple(params),
+        ).fetchone()
+        if not last:
+            return {"error": "Nessuna risposta da esportare in questa conversazione."}
+
+        answer = last["content"] or ""
+        try:
+            refs = json.loads(last.get("refs_json") or "{}")
+        except (TypeError, ValueError):
+            refs = {}
+        ref_video_ids = [int(v) for v in (refs.get("video_ids") or [])]
+        web_sources = refs.get("web_sources") or []
+
+        uwhere = ["role = 'user'", "id < %s"]
+        uparams: list[Any] = [last["id"]]
+        if video_id:
+            uwhere.append("video_id = %s")
+            uparams.append(video_id)
+        prev_user = db.execute(
+            f"SELECT content FROM {table} WHERE {' AND '.join(uwhere)} ORDER BY id DESC LIMIT 1",
+            tuple(uparams),
+        ).fetchone()
+        question = prev_user["content"] if prev_user else ""
+
+        video_refs: list[dict[str, Any]] = []
+        if ref_video_ids:
+            rows = db.execute(
+                "SELECT id, title FROM videos WHERE id = ANY(%s) ORDER BY id",
+                (ref_video_ids,),
+            ).fetchall()
+            video_refs = [{"id": r["id"], "title": r["title"]} for r in rows]
+
+        if video_id:
+            chat_rows = db.execute(
+                f"SELECT role, content FROM {table} WHERE video_id = %s ORDER BY id",
+                (video_id,),
+            ).fetchall()
+        else:
+            chat_rows = db.execute(
+                f"SELECT role, content FROM {table} ORDER BY id"
+            ).fetchall()
+        chat_json = [row_to_dict(r) for r in chat_rows]
+
+        report_title = (title or "").strip() or first_line(answer) or "Report chat"
+        body = build_report_text(report_title, question, answer, video_refs, web_sources)
+        pdf_bytes = render_pdf_bytes(body)
+        digest = hashlib.sha256(pdf_bytes).hexdigest()
+        REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        pdf_path = REPORTS_DIR / f"{digest}.pdf"
+        if not pdf_path.exists():
+            pdf_path.write_bytes(pdf_bytes)
+
+        db.execute(
+            """
+            INSERT INTO reports
+                (hash, title, scope, content, source_video_ids, web_sources, chat_json)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (hash) DO NOTHING
+            """,
+            (
+                digest,
+                report_title,
+                scope,
+                body,
+                json.dumps(video_refs, ensure_ascii=False),
+                json.dumps(web_sources, ensure_ascii=False),
+                json.dumps(chat_json, ensure_ascii=False),
+            ),
+        )
+        db.commit()
+
+    return {
+        "status": "ok",
+        "title": report_title,
+        "download_url": f"/api/reports/{digest}.pdf",
+    }

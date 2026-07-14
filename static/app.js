@@ -276,7 +276,12 @@ async function openGeneralChat() {
   const appendMessage = (role, content) => {
     const bubble = document.createElement("div");
     bubble.className = `chat-bubble ${role}`;
-    bubble.textContent = content;
+    if (role === "user") {
+      bubble.textContent = content;
+    } else {
+      bubble.classList.add("markdown");
+      bubble.innerHTML = renderMarkdown(content);
+    }
     messagesEl.append(bubble);
     messagesEl.scrollTop = messagesEl.scrollHeight;
     return bubble;
@@ -335,7 +340,8 @@ async function openGeneralChat() {
       body.set("message", text);
       gchatScope.forEach((name) => body.append("categories", name));
       const data = await readJson(await fetch("/api/chat", { method: "POST", body }));
-      pending.textContent = data.reply.content;
+      pending.classList.add("markdown");
+      pending.innerHTML = renderMarkdown(data.reply.content);
     } catch (error) {
       pending.textContent = `Errore: ${error.message}`;
       pending.classList.add("error");
@@ -758,7 +764,12 @@ async function setupChat(video) {
   const appendMessage = (role, content) => {
     const bubble = document.createElement("div");
     bubble.className = `chat-bubble ${role}`;
-    bubble.textContent = content;
+    if (role === "user") {
+      bubble.textContent = content;
+    } else {
+      bubble.classList.add("markdown");
+      bubble.innerHTML = renderMarkdown(content);
+    }
     messagesEl.append(bubble);
     messagesEl.scrollTop = messagesEl.scrollHeight;
     return bubble;
@@ -828,7 +839,8 @@ async function setupChat(video) {
       const body = new FormData();
       body.set("message", text);
       const data = await readJson(await fetch(`/api/videos/${video.id}/chat`, { method: "POST", body }));
-      pending.textContent = data.reply.content;
+      pending.classList.add("markdown");
+      pending.innerHTML = renderMarkdown(data.reply.content);
     } catch (error) {
       pending.textContent = `Errore: ${error.message}`;
       pending.classList.add("error");
@@ -965,6 +977,97 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
+}
+
+// Minimal, XSS-safe Markdown → HTML for chat messages. Input is escaped first,
+// then a small subset is applied: fenced/inline code, headings, bullet/numbered
+// lists, bold, italic, links, and paragraph/line breaks.
+function renderMarkdown(text) {
+  let html = escapeHtml(text ?? "");
+
+  // Pull code spans out first so their contents aren't touched by other rules.
+  const codeBlocks = [];
+  html = html.replace(/```[^\n]*\n([\s\S]*?)```/g, (_, code) => {
+    codeBlocks.push(code.replace(/\n$/, ""));
+    return ` CB${codeBlocks.length - 1} `;
+  });
+  const inlineCodes = [];
+  html = html.replace(/`([^`\n]+)`/g, (_, code) => {
+    inlineCodes.push(code);
+    return ` IC${inlineCodes.length - 1} `;
+  });
+
+  // Block structure: headings, lists, and paragraphs.
+  const out = [];
+  let listType = null;
+  let para = [];
+  const flushPara = () => {
+    if (para.length) {
+      out.push(`<p>${para.join("<br>")}</p>`);
+      para = [];
+    }
+  };
+  const closeList = () => {
+    if (listType) {
+      out.push(`</${listType}>`);
+      listType = null;
+    }
+  };
+  for (const line of html.split("\n")) {
+    const heading = line.match(/^(#{1,6})\s+(.*)$/);
+    const bullet = line.match(/^\s*[-*]\s+(.*)$/);
+    const numbered = line.match(/^\s*\d+\.\s+(.*)$/);
+    if (heading) {
+      flushPara();
+      closeList();
+      const level = heading[1].length;
+      out.push(`<h${level}>${heading[2]}</h${level}>`);
+    } else if (bullet) {
+      flushPara();
+      if (listType !== "ul") {
+        closeList();
+        out.push("<ul>");
+        listType = "ul";
+      }
+      out.push(`<li>${bullet[1]}</li>`);
+    } else if (numbered) {
+      flushPara();
+      if (listType !== "ol") {
+        closeList();
+        out.push("<ol>");
+        listType = "ol";
+      }
+      out.push(`<li>${numbered[1]}</li>`);
+    } else if (line.trim() === "") {
+      flushPara();
+      closeList();
+    } else {
+      closeList();
+      para.push(line);
+    }
+  }
+  flushPara();
+  closeList();
+  html = out.join("");
+
+  // Inline spans (safe: block tags contain no * or ] to confuse these).
+  html = html
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*([^*\n]+)\*/g, "<em>$1</em>")
+    .replace(
+      // Absolute http(s) links or root-relative paths (e.g. /api/reports/<hash>.pdf).
+      // Restricting the scheme keeps this XSS-safe (no javascript: URLs).
+      /\[([^\]]+)\]\((https?:\/\/[^\s)]+|\/[^\s)]+)\)/g,
+      '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>'
+    );
+
+  // Restore code spans.
+  html = html.replace(/ IC(\d+) /g, (_, i) => `<code>${inlineCodes[+i]}</code>`);
+  html = html.replace(
+    / CB(\d+) /g,
+    (_, i) => `<pre><code>${codeBlocks[+i]}</code></pre>`
+  );
+  return html;
 }
 
 function formatDuration(seconds) {

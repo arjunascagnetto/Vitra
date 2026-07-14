@@ -155,6 +155,27 @@ def init_db() -> None:
             ON CONFLICT (name) DO NOTHING
             """
         )
+        # Exported chat reports. Content-addressed by the PDF hash (also the
+        # filename on disk); records which videos/web sources produced the report.
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reports (
+                id BIGSERIAL PRIMARY KEY,
+                hash TEXT UNIQUE NOT NULL,
+                title TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                content TEXT NOT NULL,
+                source_video_ids TEXT NOT NULL DEFAULT '[]',
+                web_sources TEXT NOT NULL DEFAULT '[]',
+                chat_json TEXT NOT NULL DEFAULT '[]',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        # Per assistant message: references gathered that turn (video ids read /
+        # cited + web sources), so a later "export" can attribute the report.
+        ensure_column(db, "general_messages", "refs_json", "TEXT DEFAULT '[]'")
+        ensure_column(db, "video_messages", "refs_json", "TEXT DEFAULT '[]'")
         db.commit()
 
 
